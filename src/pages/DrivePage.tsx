@@ -1,0 +1,186 @@
+import { useState, useCallback } from 'react';
+import { useDriveStore } from '../store/useDriveStore';
+import { FileTable } from '../components/FileTable';
+import { Search, Upload, FolderPlus, LogOut, ArrowLeft, RefreshCw } from 'lucide-react';
+import { useDropzone } from 'react-dropzone';
+import { toast } from 'sonner';
+
+export function DrivePage() {
+  const { fileManager, currentPath, setCurrentPath, setWebhookUrl, searchQuery, setSearchQuery, refreshFiles } = useDriveStore();
+  const [isUploading, setIsUploading] = useState(false);
+  const [progress, setProgress] = useState(0);
+
+  const onDrop = useCallback(async (acceptedFiles: File[]) => {
+    if (!fileManager) return;
+    setIsUploading(true);
+    setProgress(0);
+    let errorCount = 0;
+    
+    // Total sizes for global progress estimation
+    const totalSize = acceptedFiles.reduce((acc, f) => acc + f.size, 0);
+    let uploadedSize = 0;
+
+    for (const file of acceptedFiles) {
+      try {
+        // webkitRelativePath allows folder uploads. E.g "myFolder/sub/file.txt"
+        const relativePath = file.webkitRelativePath || file.name;
+        
+        let pathParts = relativePath.split('/');
+        const fileName = pathParts.pop()!;
+        const dirs = pathParts;
+        
+        // Ensure parent directories exist
+        let builtPath = currentPath;
+        for (const dir of dirs) {
+          const dirPath = builtPath ? `${builtPath}/${dir}` : dir;
+          if (!fileManager.getFile(dirPath)) {
+             await fileManager.createDirectory(dirPath);
+          }
+          builtPath = dirPath;
+        }
+
+        const exactPath = builtPath ? `${builtPath}/${fileName}` : fileName;
+
+        await fileManager.uploadFile(exactPath, file, () => {
+           // We use the increment of data purely for overall progress.
+           // However it's easier to just guess or do exact math.
+           // For simplicity, we update progress after each file completes.
+        });
+        uploadedSize += file.size;
+        setProgress((uploadedSize / totalSize) * 100);
+
+      } catch (err) {
+        console.error(err);
+        errorCount++;
+        toast.error(`Échec upload: ${file.name}`);
+      }
+    }
+    
+    refreshFiles();
+    setIsUploading(false);
+    setProgress(0);
+    if (errorCount === 0) toast.success(`${acceptedFiles.length} fichier(s) uploadé(s)`);
+  }, [fileManager, currentPath, refreshFiles]);
+
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({ onDrop, noClick: true });
+
+  const handleCreateFolder = async () => {
+    if (!fileManager) return;
+    const name = window.prompt("Nom du nouveau dossier ?");
+    if (!name?.trim()) return;
+    if (name.includes("/")) {
+      toast.error("Le nom ne peut pas contenir '/'");
+      return;
+    }
+    try {
+      const path = currentPath ? `${currentPath}/${name}` : name;
+      await fileManager.createDirectory(path);
+      refreshFiles();
+      toast.success("Dossier créé");
+    } catch(e: any) {
+      toast.error(e.message);
+    }
+  };
+
+  const handleLogout = () => {
+    if (confirm("Se déconnecter ? Le webhook sera oublié.")) {
+      setWebhookUrl(null);
+    }
+  };
+
+  const breadcrumbs = currentPath.split('/').filter(Boolean);
+
+  return (
+    <div {...getRootProps()} className={`flex flex-col h-screen text-textPrimary bg-background transition-colors ${isDragActive ? 'bg-discord/10 border-2 border-discord border-dashed' : ''}`}>
+      <input {...getInputProps()} />
+      {/* Header */}
+      <header className="h-16 border-b border-white/5 bg-surface/80 flex items-center justify-between px-4">
+        <div className="flex items-center gap-4">
+          <div className="font-bold text-xl text-discord">Distock</div>
+          
+          <div className="flex items-center gap-2 overflow-x-auto whitespace-nowrap text-sm text-textSecondary select-none">
+            <span className="cursor-pointer hover:text-white" onClick={() => setCurrentPath('')}>Maison</span>
+            {breadcrumbs.map((crumb, idx) => {
+              const cp = breadcrumbs.slice(0, idx + 1).join('/');
+              return (
+                <span key={cp} className="flex items-center gap-2">
+                  <span>/</span>
+                  <span className="cursor-pointer hover:text-white font-medium" onClick={() => setCurrentPath(cp)}>
+                    {crumb}
+                  </span>
+                </span>
+              );
+            })}
+          </div>
+        </div>
+        
+        <div className="flex items-center gap-3">
+           <div className="relative">
+             <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-textSecondary" />
+             <input type="text" placeholder="Rechercher..." 
+               value={searchQuery}
+               onChange={(e) => setSearchQuery(e.target.value)}
+               className="bg-background border border-white/10 rounded-full pl-9 pr-4 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-discord w-64" />
+           </div>
+           
+           <button onClick={() => refreshFiles()} className="p-2 rounded-lg hover:bg-white/5 text-textSecondary hover:text-white transition-colors" title="Actualiser">
+              <RefreshCw className="w-5 h-5"/>
+           </button>
+           <button onClick={handleLogout} className="p-2 rounded-lg hover:bg-red-500/10 text-red-400 transition-colors" title="Déconnexion">
+              <LogOut className="w-5 h-5"/>
+           </button>
+        </div>
+      </header>
+
+      {/* Toolbar */}
+      <div className="p-4 flex items-center gap-2 border-b border-white/5">
+        {currentPath && (
+          <button onClick={() => setCurrentPath(currentPath.substring(0, currentPath.lastIndexOf('/')))} className="px-3 py-1.5 rounded bg-surface hover:bg-surface/80 border border-white/5 flex items-center gap-2 text-sm font-medium">
+             <ArrowLeft className="w-4 h-4" /> Retour
+          </button>
+        )}
+        <label className="px-3 py-1.5 rounded bg-discord hover:bg-discord/90 text-white cursor-pointer flex items-center gap-2 text-sm font-medium transition-colors">
+          <Upload className="w-4 h-4" />
+          <span>Upload</span>
+          <input type="file" multiple className="hidden" webkitdirectory="" onChange={(e) => {
+             if (e.target.files) {
+               // convert FileList to File array to match Dropzone
+               const arr = Array.from(e.target.files);
+               onDrop(arr);
+               e.target.value = '';
+             }
+          }} />
+        </label>
+        <button onClick={handleCreateFolder} className="px-3 py-1.5 rounded bg-surface hover:bg-surface/80 border border-white/5 flex items-center gap-2 text-sm font-medium transition-colors">
+           <FolderPlus className="w-4 h-4" />
+           <span>Nouveau Dossier</span>
+        </button>
+        <span className="text-textSecondary text-xs ml-4">Glissez-déposez des fichiers/dossiers n'importe où.</span>
+      </div>
+
+      {isUploading && (
+         <div className="px-4 py-2 bg-discord/20 border-b border-discord/30 text-sm flex items-center gap-4">
+            <span className="flex items-center gap-2 font-medium"><div className="w-4 h-4 rounded-full border-2 border-t-transparent border-white animate-spin"></div> Upload en cours...</span>
+            <div className="flex-1 bg-black/50 h-2 rounded-full overflow-hidden">
+               <div className="h-full bg-discord transition-all duration-300" style={{ width: `${progress}%`}}></div>
+            </div>
+            <span>{progress.toFixed(0)}%</span>
+         </div>
+      )}
+
+      {/* Main Content */}
+      <main className="flex-1 overflow-hidden flex flex-col relative w-full">
+         <FileTable />
+      </main>
+      
+      {/* Mobile Footer Spacing if needed */}
+      <div className="md:hidden h-16"/>
+    </div>
+  );
+}
+// Add webkitdirectory shim for TS
+declare module 'react' {
+  interface HTMLAttributes<T> extends AriaAttributes, DOMAttributes<T> {
+    webkitdirectory?: string;
+  }
+}
