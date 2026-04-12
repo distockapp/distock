@@ -4,7 +4,7 @@
 
 Distock est un client web moderne ("Serverless" côté fichiers) qui détourne l'usage principal de l'API Webhook de Discord pour l'utiliser comme un cloud personnel extrêmement performant et sans aucune limite d'espace de stockage.
 
-🔴 **Live Demo** : [https://{ton-username}.github.io/distock/](https://{ton-username}.github.io/distock/)
+🔴 **Live Demo** : [https://evan96969.github.io/distock/](https://evan96969.github.io/distock/)
 
 ---
 
@@ -47,7 +47,7 @@ Assurez-vous d'avoir Node.js (v18+) installé.
 
 ```bash
 # 1. Cloner le repository
-git clone https://github.com/{ton-username}/distock.git
+git clone https://github.com/evan96969/distock.git
 cd distock
 
 # 2. Installer les dépendances
