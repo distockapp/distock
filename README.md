@@ -4,7 +4,7 @@
 
 Distock est un client web moderne ("Serverless" côté fichiers) qui détourne l'usage principal de l'API Webhook de Discord pour l'utiliser comme un cloud personnel extrêmement performant et sans aucune limite d'espace de stockage.
 
-🔴 **Live Demo** : [https://evan96969.github.io/distock/](https://evan96969.github.io/distock/)
+🔴 **Live Demo** : [https://evan96969.github.io/distock/](https://disboxapp.github.io/distock/)
 
 ---
 
