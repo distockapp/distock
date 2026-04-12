@@ -1,0 +1,1 @@
+(function(){self.onmessage=async e=>{let{file:t,chunkSize:n,offset:r}=e.data;if(t)try{let e=Math.min(r+n,t.size),i=await t.slice(r,e).arrayBuffer();self.postMessage({buffer:i,nextOffset:e,done:e>=t.size},[i])}catch(e){self.postMessage({error:e instanceof Error?e.message:`Unknown chunking error`})}}})();
