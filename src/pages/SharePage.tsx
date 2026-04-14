@@ -122,7 +122,7 @@ export function SharePage() {
       const zip = new JSZip();
       let downloadedBytes = 0;
       
-      for (const [idx, f] of folderDetails.files.entries()) {
+      for (const f of folderDetails.files) {
          const chunks: ArrayBuffer[] = [];
          for (const u of f.urls) {
              const chunkBlob = await fetchProxiedChunk(u);

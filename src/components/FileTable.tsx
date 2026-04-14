@@ -13,7 +13,7 @@ import type { ColumnDef, SortingState } from '@tanstack/react-table';
 import { ContextMenu } from './ContextMenu';
 import { MoveDialog } from './MoveDialog';
 import { toast } from 'sonner';
-import { File, Folder, Image, FileText, Film, Music, Archive as ArchiveIcon, MoreVertical, X, DownloadCloud, Trash2, FolderInput } from 'lucide-react';
+import { File as FileIcon, Folder, Image, FileText, Film, Music, Archive as ArchiveIcon, MoreVertical, X, DownloadCloud, Trash2, FolderInput } from 'lucide-react';
 import pako from 'pako';
 
 function getFileIcon(file: DisboxFile) {
@@ -25,7 +25,7 @@ function getFileIcon(file: DisboxFile) {
     case 'mp4': case 'mkv': case 'webm': return <Film className="w-5 h-5 text-red-400" />;
     case 'mp3': case 'wav': case 'ogg': return <Music className="w-5 h-5 text-yellow-400" />;
     case 'zip': case 'rar': case '7z': case 'tar': case 'gz': return <ArchiveIcon className="w-5 h-5 text-orange-400" />;
-    default: return <File className="w-5 h-5 text-gray-300" />;
+    default: return <FileIcon className="w-5 h-5 text-gray-300" />;
   }
 }
 
@@ -184,7 +184,7 @@ export function FileTable() {
             const fileObj = new File([blob], 'dir_manifest.bin');
             
             const msgIds = await fileManager.discordFileStorage.upload(fileObj, "manifest");
-            const manifestUrls = await fileManager.getAttachmentUrls(msgIds);
+            const manifestUrls = await fileManager.discordFileStorage.getAttachmentUrls(msgIds);
             
             const url = `${window.location.origin}${window.location.pathname}#/share?manifest=${encodeURIComponent(manifestUrls[0])}`;
             await navigator.clipboard.writeText(url);
