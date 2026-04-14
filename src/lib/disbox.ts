@@ -171,10 +171,17 @@ class DiscordFileStorage {
   }
 
   async upload(sourceFile: File, namePrefix: string, onProgress?: ProgressCallback, abortSignal?: AbortSignal): Promise<string[]> {
-    const ids: string[] = [];
-    let uploadedBytes = 0;
+    const resumeKey = `distock_resume_${encodeURIComponent(sourceFile.name)}_${sourceFile.size}`;
+    const cached = localStorage.getItem(resumeKey);
+    const ids: string[] = cached ? JSON.parse(cached) : [];
+    let uploadedBytes = ids.length * CHUNK_SIZE;
+    
+    if (uploadedBytes > 0 && onProgress) {
+      console.log(`[Disbox] Reprise de l'upload détectée (${ids.length} fragments déjà en ligne)`);
+      onProgress(uploadedBytes, sourceFile.size);
+    }
 
-    for (let i = 0; i < sourceFile.size; i += CHUNK_SIZE) {
+    for (let i = ids.length * CHUNK_SIZE; i < sourceFile.size; i += CHUNK_SIZE) {
       if (abortSignal?.aborted) throw new Error("Upload aborted");
       
       const chunkBlob = sourceFile.slice(i, i + CHUNK_SIZE);
@@ -195,6 +202,7 @@ class DiscordFileStorage {
         }
         
         try {
+          const startTime = Date.now();
           const formData = new FormData();
           formData.append('payload_json', JSON.stringify({}));
           formData.append('file', chunkBlob, `${namePrefix}_chunk_${ids.length}`);
@@ -208,7 +216,11 @@ class DiscordFileStorage {
           clearTimeout(timeout);
           const data = await response.json();
           
-          await new Promise(r => setTimeout(r, 650));
+          // Cloudflare/Discord strict rate limit evasion (max ~25 requests/min)
+          const elapsed = Date.now() - startTime;
+          if (elapsed < 2500) {
+            await new Promise(r => setTimeout(r, 2500 - elapsed));
+          }
           
           ids.push(data.id);
           uploadedBytes += chunkBlob.size;
@@ -216,6 +228,9 @@ class DiscordFileStorage {
           if (onProgress) {
             onProgress(uploadedBytes, sourceFile.size);
           }
+          
+          // Save resumable progress block
+          localStorage.setItem(resumeKey, JSON.stringify(ids));
           success = true;
         } catch (err: any) {
           clearTimeout(timeout);
@@ -225,7 +240,8 @@ class DiscordFileStorage {
           }
           console.warn(`Upload chunk attempt ${attempts} failed:`, err);
           if (attempts < 5) {
-             await new Promise(r => setTimeout(r, 2000 * attempts)); // Exponential backoff waiting 2, 4, 6, 8s
+             // Cloudflare IP bans usually last 1 minute. We back off aggressively: 15s, 30s, 45s...
+             await new Promise(r => setTimeout(r, 15000 * attempts)); 
           }
         }
       }
@@ -233,6 +249,9 @@ class DiscordFileStorage {
          throw lastErr;
       }
     }
+    
+    // Upload fully completed, clean up resume cache
+    localStorage.removeItem(resumeKey);
     return ids;
   }
 
