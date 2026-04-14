@@ -80,25 +80,29 @@ class DiscordWebhookClient {
     });
   }
 
+  private async _doFetch(path: string, options: RequestInit, retries = 3): Promise<Response> {
+    const response = await fetch(`${this.baseUrl}${path}`, options);
+    if (response.status === 429) {
+      const retryAfterStr = response.headers.get('Retry-After');
+      const retryAfter = Number(retryAfterStr || 2) * 1000;
+      console.warn(`[Disbox] Rate limited by Discord. Waiting ${retryAfter}ms`);
+      if (retries > 0) {
+        await sleep(retryAfter);
+        return this._doFetch(path, options, retries - 1); // Exactement pas via enqueue
+      }
+    }
+    if (response.status === 413) {
+      throw new Error(`Chunk trop volumineux (413). Le fichier excède la limite Discord.`);
+    }
+    if (response.status >= 400 && response.status !== 404) {
+      throw new Error(`Failed Discord API ${options.method} with ${response.status}`);
+    }
+    return response;
+  }
+
   async fetchWithRateLimit(path: string, options: RequestInit, retries = 3): Promise<Response> {
     return this.enqueue(async () => {
-      const response = await fetch(`${this.baseUrl}${path}`, options);
-      if (response.status === 429) {
-        const retryAfterStr = response.headers.get('Retry-After');
-        const retryAfter = Number(retryAfterStr || 2) * 1000;
-        console.warn(`[Disbox] Rate limited by Discord. Waiting ${retryAfter}ms`);
-        if (retries > 0) {
-          await sleep(retryAfter);
-          return this.fetchWithRateLimit(path, options, retries - 1); // Pas via enqueue pour ne pas re-diluer
-        }
-      }
-      if (response.status === 413) {
-        throw new Error(`Chunk trop volumineux (413). Le fichier excède la limite Discord.`);
-      }
-      if (response.status >= 400 && response.status !== 404) {
-        throw new Error(`Failed Discord API ${options.method} with ${response.status}`);
-      }
-      return response;
+      return this._doFetch(path, options, retries);
     });
   }
 
