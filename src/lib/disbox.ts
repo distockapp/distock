@@ -3,9 +3,25 @@ import type { DisboxFile, DisboxTree } from './types';
 import { sleep } from './utils';
 import JSZip from 'jszip';
 
+import { CHUNK_SIZE } from './constants';
+
 const SERVER_URL = 'https://disbox-server.fly.dev';
 export const FILE_DELIMITER = '/';
-const FILE_CHUNK_SIZE = 25 * 1024 * 1023; // Almost 25MB
+
+async function apiFetch(url: string, init?: RequestInit): Promise<Response> {
+  try {
+    return await fetch(url, init);
+  } catch (err: any) {
+    if (err.name === 'AbortError') throw err;
+    console.warn(`Direct fetch failed. Retrying via proxy: ${url}`);
+    try {
+      return await fetch(`https://corsproxy.io/?${encodeURIComponent(url)}`, init);
+    } catch (e) {
+      throw err;
+    }
+  }
+}
+
 
 // Type pour la progression
 export type ProgressCallback = (value: number, total: number) => void;
@@ -76,6 +92,9 @@ class DiscordWebhookClient {
           return this.fetchWithRateLimit(path, options, retries - 1); // Pas via enqueue pour ne pas re-diluer
         }
       }
+      if (response.status === 413) {
+        throw new Error(`Chunk trop volumineux (413). Le fichier excède la limite Discord.`);
+      }
       if (response.status >= 400 && response.status !== 404) {
         throw new Error(`Failed Discord API ${options.method} with ${response.status}`);
       }
@@ -128,67 +147,77 @@ class DiscordFileStorage {
     return urls;
   }
 
-  async upload(sourceFile: File, namePrefix: string, onProgress?: ProgressCallback, signal?: AbortSignal): Promise<string[]> {
-    const messageIds: string[] = [];
+  async upload(sourceFile: File, namePrefix: string, onProgress?: ProgressCallback, abortSignal?: AbortSignal): Promise<string[]> {
+    const ids: string[] = [];
     let uploadedBytes = 0;
+
+    for (let i = 0; i < sourceFile.size; i += CHUNK_SIZE) {
+      if (abortSignal?.aborted) throw new Error("Upload aborted");
+      
+      const chunkBlob = sourceFile.slice(i, i + CHUNK_SIZE);
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 300_000); // 5 min timeout
+      
+      if (abortSignal) {
+         abortSignal.addEventListener('abort', () => controller.abort());
+      }
+      
+      try {
+        const formData = new FormData();
+        formData.append('payload_json', JSON.stringify({}));
+        formData.append('file', chunkBlob, `${namePrefix}_chunk_${ids.length}`);
+
+        // We bypass the webhookClient sendAttachment because we want explicit timeout and signal proxy support here directly
+        const response = await this.webhookClient.fetchWithRateLimit('?wait=true', {
+          method: 'POST',
+          body: formData,
+          signal: controller.signal
+        });
+        
+        clearTimeout(timeout);
+        const data = await response.json();
+        
+        // Wait for attachment to settle (Discord propagation)
+        await new Promise(r => setTimeout(r, 650));
+        
+        ids.push(data.id);
+        uploadedBytes += chunkBlob.size;
+        
+        if (onProgress) {
+          onProgress(uploadedBytes, sourceFile.size);
+        }
+      } catch (err: any) {
+        clearTimeout(timeout);
+        if (err.name === 'AbortError') {
+          throw new Error('Timeout upload — vérifiez votre connexion.');
+        }
+        throw err;
+      }
+    }
+    return ids;
+  }
+
+  async fetchProxiedChunk(url: string): Promise<Blob> {
+    const proxies = [
+      url, // Direct CDN (might work if CORS allows)
+      `https://corsproxy.io/?${encodeURIComponent(url)}`,
+      `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+      `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`
+    ];
     
-    if (onProgress) onProgress(0, sourceFile.size);
-
-    return new Promise((resolve, reject) => {
-      const worker = new Worker(new URL('../workers/chunking.worker.ts', import.meta.url), { type: 'module' });
-      let currentOffset = 0;
-      let chunkIndex = 0;
-
-      const processNextChunk = () => {
-        if (signal?.aborted) {
-          worker.terminate();
-          reject(new Error('Aborted'));
-          return;
-        }
-
-        if (currentOffset >= sourceFile.size) {
-          worker.terminate();
-          resolve(messageIds);
-          return;
-        }
-
-        worker.postMessage({ file: sourceFile, chunkSize: FILE_CHUNK_SIZE, offset: currentOffset });
-      };
-
-      worker.onmessage = async (e) => {
-        if (e.data.error) {
-          worker.terminate();
-          reject(new Error(e.data.error));
-          return;
-        }
-
-        if (signal?.aborted) {
-          worker.terminate();
-          reject(new Error('Aborted'));
-          return;
-        }
-
-        const buffer = e.data.buffer as ArrayBuffer;
-        const blob = new Blob([buffer]);
-        try {
-          const result = await this.webhookClient.sendAttachment(`${namePrefix}_${chunkIndex}`, blob, signal);
-          messageIds.push(result.id);
-          uploadedBytes += buffer.byteLength;
-          chunkIndex++;
-          currentOffset = e.data.nextOffset;
-
-          if (onProgress) onProgress(uploadedBytes, sourceFile.size);
-
-          processNextChunk();
-        } catch (err) {
-          worker.terminate();
-          reject(err);
-        }
-      };
-
-      // Start
-      processNextChunk();
-    });
+    let lastError: any = null;
+    for (const proxyUrl of proxies) {
+      try {
+        const response = await fetch(proxyUrl);
+        if (!response.ok) throw new Error(`Proxy HTTP ${response.status}`);
+        // Await full blob to catch premature TCP cutoffs by proxies before writing to disk
+        return await response.blob();
+      } catch (e) {
+        console.warn(`Proxy failed: ${proxyUrl}`, e);
+        lastError = e;
+      }
+    }
+    throw new Error(lastError instanceof Error ? lastError.message : String(lastError));
   }
 
   async download(messageIds: string[], writeStream: WritableStreamDefaultWriter, onProgress?: ProgressCallback, fileSize = -1): Promise<void> {
@@ -197,21 +226,12 @@ class DiscordFileStorage {
     if (onProgress) onProgress(0, fileSize);
 
     for (const url of urls) {
-      // Use AllOrigins proxy to bypass CORS
-      const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
-      const response = await fetch(proxyUrl);
-      if (!response.ok) throw new Error(`Failed to fetch chunk: ${response.status}`);
-      // Streaming read
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error("ReadableStream not supported");
+      const chunkBlob = await this.fetchProxiedChunk(url);
+      const chunkData = new Uint8Array(await chunkBlob.arrayBuffer());
+      await writeStream.write(chunkData);
       
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        await writeStream.write(value);
-        bytesDownloaded += value.length;
-        if (onProgress) onProgress(bytesDownloaded, Math.max(fileSize, bytesDownloaded));
-      }
+      bytesDownloaded += chunkData.byteLength;
+      if (onProgress) onProgress(bytesDownloaded, Math.max(fileSize, bytesDownloaded));
     }
     await writeStream.close();
   }
@@ -219,7 +239,9 @@ class DiscordFileStorage {
   async delete(messageIds: string[], onProgress?: ProgressCallback) {
     let deleted = 0;
     for (const id of messageIds) {
-      await this.webhookClient.deleteMessage(id).catch(() => {});
+      await this.webhookClient.deleteMessage(id).catch((e) => {
+        console.error(`Failed to delete message ${id}`, e);
+      });
       deleted++;
       if (onProgress) onProgress(deleted, messageIds.length);
     }
@@ -232,24 +254,67 @@ export class DisboxFileManager {
   fileTree: DisboxTree;
 
   static async create(webhookUrl: string): Promise<DisboxFileManager> {
-    const url = new URL(webhookUrl);
-    let fileTrees: Record<string, any> = {};
+    const hostnames = ["discord.com", "discordapp.com"];
+    
+    // Fetch both in parallel to save time
+    const results = await Promise.allSettled(hostnames.map(async (hostname) => {
+      const fetchUrl = new URL(webhookUrl);
+      fetchUrl.hostname = hostname;
+      const hashed = sha256(fetchUrl.href);
 
-    for (const hostname of ["discord.com", "discordapp.com"]) {
-      url.hostname = hostname;
-      const hashed = sha256(url.href);
-      const res = await fetch(`${SERVER_URL}/files/get/${hashed}`);
-      if (res.ok) {
-        fileTrees[url.href] = await res.json();
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 60000); // 60s timeout for cold starts
+
+      try {
+        const res = await apiFetch(`${SERVER_URL}/files/get/${hashed}`, { 
+          signal: controller.signal, 
+          cache: 'no-store' 
+        });
+        clearTimeout(timeout);
+        
+        if (res.ok) {
+          return { url: fetchUrl.href, tree: await res.json() };
+        }
+        return null;
+      } catch (err: any) {
+        clearTimeout(timeout);
+        if (err.name === 'AbortError') throw new Error("SERVER_TIMEOUT");
+        throw err;
+      }
+    }));
+
+    const fileTrees: Record<string, any> = {};
+    let hasTimeout = false;
+
+    for (const res of results) {
+      if (res.status === 'fulfilled' && res.value) {
+        fileTrees[res.value.url] = res.value.tree;
+      } else if (res.status === 'rejected' && res.reason?.message === "SERVER_TIMEOUT") {
+        hasTimeout = true;
       }
     }
 
     if (Object.keys(fileTrees).length === 0) {
+      if (hasTimeout) throw new Error("SERVER_TIMEOUT");
       throw new Error(`Failed to get files for user.`);
     }
 
-    const [chosenUrl, fileTree] = Object.entries(fileTrees).sort((a, b) => b[1].length - a[1].length)[0];
+    const [chosenUrl, fileTree] = Object.entries(fileTrees).sort((a, b) => {
+      const lenA = Object.keys(a[1].children || {}).length;
+      const lenB = Object.keys(b[1].children || {}).length;
+      if (lenA === lenB) return a[0].localeCompare(b[0]);
+      return lenB - lenA;
+    })[0];
+    
     return new DisboxFileManager(sha256(chosenUrl), new DiscordFileStorage(webhookUrl), fileTree as DisboxTree);
+  }
+
+
+  async syncWithServer() {
+    const res = await apiFetch(`${SERVER_URL}/files/get/${this.userId}`, { cache: 'no-store' });
+    if (res.ok) {
+      this.fileTree = await res.json();
+    }
   }
 
   constructor(userId: string, storage: DiscordFileStorage, fileTree: DisboxTree) {
@@ -277,7 +342,10 @@ export class DisboxFileManager {
   getChildren(path: string): Record<string, DisboxFile> {
     const file = path === "" ? this.fileTree : this.getFile(path);
     if (!file) throw new Error(`Path not found: ${path}`);
-    if (file.type !== "directory") throw new Error(`Not a directory: ${path}`);
+    
+    // Only strictly enforce directory type checking if it's not the virtual root,
+    // as the API may return the fileTree object without a 'type' property at the root level.
+    if (path !== "" && file.type !== "directory") throw new Error(`Not a directory: ${path}`);
     
     const children = file.children || {};
     const parsed: Record<string, DisboxFile> = {};
@@ -301,12 +369,12 @@ export class DisboxFileManager {
     
     changes.updated_at = new Date().toISOString();
     
-    const result = await fetch(`${SERVER_URL}/files/update/${this.userId}/${file.id}`, {
+    const result = await apiFetch(`${SERVER_URL}/files/update/${this.userId}/${file.id}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(changes)
     });
-    if (!result.ok) throw new Error(`Update failed: ${result.statusText}`);
+    if (!result.ok) throw new Error(`Update failed: ${await result.text()}`);
     Object.assign(file, changes);
     return file;
   }
@@ -368,20 +436,27 @@ export class DisboxFileManager {
       type,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
-      ...(type === 'directory' ? { children: {} } : {})
     };
-
-    const res = await fetch(`${SERVER_URL}/files/create/${this.userId}`, {
+    
+    // Explicitly exclude 'children' from the body to avoid 400 Bad Request
+    const res = await apiFetch(`${SERVER_URL}/files/create/${this.userId}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(newFile)
     });
-    if (!res.ok) throw new Error(`Creation failed`);
     
-    const newId = Number(await res.text());
+    if (!res.ok) throw new Error(`Creation failed: ${await res.text()}`);
+    
+    const newIdText = await res.text();
+    const newId = Number(newIdText);
+
     const parentNode = this.getFile(parentPath, false)!;
     if (!parentNode.children) parentNode.children = {};
-    parentNode.children[name] = { ...newFile, id: newId } as DisboxFile;
+    parentNode.children[name] = { 
+      ...newFile, 
+      id: newId, 
+      ...(type === 'directory' ? { children: {} } : {}) 
+    } as DisboxFile;
     
     return this.getFile(path);
   }
@@ -469,7 +544,7 @@ export class DisboxFileManager {
   }
 
   private async _deleteEmptyAPI(file: DisboxFile) {
-    const result = await fetch(`${SERVER_URL}/files/delete/${this.userId}/${file.id}`, { method: 'DELETE' });
+    const result = await apiFetch(`${SERVER_URL}/files/delete/${this.userId}/${file.id}`, { method: 'DELETE' });
     if (!result.ok) throw new Error("Delete failed");
     
     if (file.path) {
@@ -491,7 +566,7 @@ export class DisboxFileManager {
       return;
     }
 
-    const result = await fetch(`${SERVER_URL}/files/delete/${this.userId}/${file.id}`, { method: 'DELETE' });
+    const result = await apiFetch(`${SERVER_URL}/files/delete/${this.userId}/${file.id}`, { method: 'DELETE' });
     if (!result.ok) throw new Error("Delete failed");
 
     if (file.content) {
@@ -520,9 +595,8 @@ export class DisboxFileManager {
       const fileBlobParts: Blob[] = [];
       
       for (const url of urls) {
-        const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
-        const res = await fetch(proxyUrl);
-        fileBlobParts.push(await res.blob());
+        const chunkBlob = await this.discordFileStorage.fetchProxiedChunk(url);
+        fileBlobParts.push(chunkBlob);
       }
       
       const fullBlob = new Blob(fileBlobParts);
@@ -541,6 +615,57 @@ export class DisboxFileManager {
     const a = document.createElement('a');
     a.href = downloadUrl;
     a.download = `${root.name}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(downloadUrl);
+  }
+  async downloadMultipleAsZip(files: DisboxFile[], zipName: string = "Distock_Selection.zip", onProgress?: ProgressCallback) {
+    const zip = new JSZip();
+    const allFilesToZip: { file: DisboxFile, relativePath: string }[] = [];
+
+    const flattenToZip = (list: DisboxFile[], currentPath: string = "") => {
+       for (const f of list) {
+          if (f.type === 'directory') {
+             const dirNode = this.getFile(f.path!);
+             if (dirNode && dirNode.children) {
+                 flattenToZip(Object.values(dirNode.children), `${currentPath}${f.name}/`);
+             }
+          } else {
+             allFilesToZip.push({ file: f, relativePath: `${currentPath}${f.name}` });
+          }
+       }
+    };
+
+    flattenToZip(files);
+
+    let processed = 0;
+    for (const item of allFilesToZip) {
+      const f = item.file;
+      if (!f.content) continue;
+      const ids = JSON.parse(f.content);
+      const urls = await this.discordFileStorage.getAttachmentUrls(ids);
+      const fileBlobParts: Blob[] = [];
+      
+      for (const url of urls) {
+        const chunkBlob = await this.discordFileStorage.fetchProxiedChunk(url);
+        fileBlobParts.push(chunkBlob);
+      }
+      
+      const fullBlob = new Blob(fileBlobParts);
+      zip.file(item.relativePath, fullBlob);
+      
+      processed++;
+      if (onProgress) onProgress(processed, allFilesToZip.length);
+    }
+
+    if (processed === 0) return; // Nothing to zip
+
+    const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
+    const downloadUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = downloadUrl;
+    a.download = zipName;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);

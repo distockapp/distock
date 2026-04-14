@@ -33,10 +33,18 @@ export function ContextMenu({
   
   const isDir = config.file.type === 'directory';
 
+  // Prevent right-edge overflow
+  const menuWidth = 224; // w-56 = 14rem = 224px
+  const x = config.x + menuWidth > window.innerWidth ? config.x - menuWidth : config.x;
+  
+  // Prevent bottom-edge overflow (approximate height 250px)
+  const approxHeight = isDir ? 200 : 250;
+  const y = config.y + approxHeight > window.innerHeight ? window.innerHeight - approxHeight - 16 : config.y;
+
   return (
     <div 
       ref={ref}
-      style={{ top: config.y, left: config.x }}
+      style={{ top: y, left: x }}
       className="fixed z-50 w-56 bg-surface/95 backdrop-blur-xl border border-white/10 shadow-2xl rounded-lg py-1 text-sm text-textPrimary"
     >
       {isDir ? (

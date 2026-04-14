@@ -8,13 +8,15 @@ interface DriveState {
   currentPath: string;
   files: DisboxFile[];
   isLoading: boolean;
+  error: string | null;
   searchQuery: string;
   
   setWebhookUrl: (url: string | null) => void;
   initManager: (url: string) => Promise<void>;
   setCurrentPath: (path: string) => void;
-  refreshFiles: () => void;
+  refreshFiles: (forceSync?: boolean) => Promise<void>;
   setSearchQuery: (query: string) => void;
+  setError: (error: string | null) => void;
 }
 
 export const useDriveStore = create<DriveState>((set, get) => ({
@@ -23,24 +25,31 @@ export const useDriveStore = create<DriveState>((set, get) => ({
   currentPath: '',
   files: [],
   isLoading: false,
+  error: null,
   searchQuery: '',
 
   setWebhookUrl: (url) => {
     if (url) localStorage.setItem('webhookUrl', url);
     else localStorage.removeItem('webhookUrl');
-    set({ webhookUrl: url });
+    set({ webhookUrl: url, error: null });
   },
 
+  setError: (error) => set({ error }),
+
   initManager: async (url) => {
-    set({ isLoading: true });
+    set({ isLoading: true, error: null });
     try {
       const manager = await DisboxFileManager.create(url);
       set({ fileManager: manager });
-      get().refreshFiles();
+      await get().refreshFiles();
+    } catch (e: any) {
+      set({ error: e.message });
+      throw e;
     } finally {
       set({ isLoading: false });
     }
   },
+
 
   setCurrentPath: (path) => {
     set({ currentPath: path });
@@ -52,9 +61,18 @@ export const useDriveStore = create<DriveState>((set, get) => ({
     get().refreshFiles();
   },
 
-  refreshFiles: () => {
+  refreshFiles: async (forceSync = false) => {
     const { fileManager, currentPath, searchQuery } = get();
     if (!fileManager) return;
+    
+    if (forceSync) {
+      set({ isLoading: true });
+      try {
+        await fileManager.syncWithServer();
+      } finally {
+        set({ isLoading: false });
+      }
+    }
     
     let resultFiles: DisboxFile[] = [];
 

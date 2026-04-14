@@ -13,7 +13,7 @@ import type { ColumnDef, SortingState } from '@tanstack/react-table';
 import { ContextMenu } from './ContextMenu';
 import { MoveDialog } from './MoveDialog';
 import { toast } from 'sonner';
-import { File, Folder, Image, FileText, Film, Music, Archive as ArchiveIcon } from 'lucide-react';
+import { File, Folder, Image, FileText, Film, Music, Archive as ArchiveIcon, MoreVertical, X, DownloadCloud, Trash2, FolderInput } from 'lucide-react';
 import pako from 'pako';
 
 function getFileIcon(file: DisboxFile) {
@@ -32,17 +32,41 @@ function getFileIcon(file: DisboxFile) {
 export function FileTable() {
   const { files, fileManager, setCurrentPath, refreshFiles } = useDriveStore();
   const [sorting, setSorting] = useState<SortingState>([]);
+  const [rowSelection, setRowSelection] = useState({});
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, file?: DisboxFile } | null>(null);
-  const [moveDialogFile, setMoveDialogFile] = useState<DisboxFile | null>(null);
+  const [moveDialogFiles, setMoveDialogFiles] = useState<DisboxFile[] | null>(null);
 
   const columns = useMemo<ColumnDef<DisboxFile>[]>(() => [
+    {
+      id: 'select',
+      header: ({ table }) => (
+        <div className="pl-2">
+          <input 
+            type="checkbox" 
+            checked={table.getIsAllPageRowsSelected()}
+            onChange={table.getToggleAllPageRowsSelectedHandler()}
+            className="w-4 h-4 rounded border-white/20 bg-transparent text-discord focus:ring-discord accent-discord cursor-pointer"
+          />
+        </div>
+      ),
+      cell: ({ row }) => (
+        <div className="pl-2 flex items-center h-full" onClick={e => e.stopPropagation()}>
+           <input 
+             type="checkbox" 
+             checked={row.getIsSelected()}
+             onChange={row.getToggleSelectedHandler()}
+             className="w-4 h-4 rounded border-white/20 bg-transparent text-discord focus:ring-discord accent-discord cursor-pointer"
+           />
+        </div>
+      ),
+    },
     {
       accessorKey: 'name',
       header: 'Nom',
       cell: (info) => (
         <div className="flex items-center gap-3">
           {getFileIcon(info.row.original)}
-          <span className="font-medium truncate max-w-[300px]">{info.getValue() as string}</span>
+          <span className="font-medium truncate max-w-[300px] select-none">{info.getValue() as string}</span>
         </div>
       ),
       sortingFn: 'alphanumeric'
@@ -56,17 +80,39 @@ export function FileTable() {
       accessorKey: 'size',
       header: 'Taille',
       cell: (info) => formatSize(info.getValue() as number),
+    },
+    {
+      id: 'actions',
+      header: '',
+      cell: (info) => (
+        <div className="flex justify-end pr-2">
+          <button 
+            className="p-2 rounded-lg text-textSecondary hover:text-white hover:bg-white/10 transition-colors"
+            onClick={(e) => {
+              e.stopPropagation();
+              setContextMenu({ x: e.clientX, y: e.clientY, file: info.row.original });
+            }}
+            title="Options"
+          >
+            <MoreVertical className="w-5 h-5"/>
+          </button>
+        </div>
+      )
     }
   ], []);
 
   const table = useReactTable({
     data: files,
     columns,
-    state: { sorting },
+    state: { sorting, rowSelection },
+    enableRowSelection: true,
+    onRowSelectionChange: setRowSelection,
     onSortingChange: setSorting,
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
   });
+
+  const selectedFiles = table.getSelectedRowModel().flatRows.map(r => r.original);
 
   // --- ACTIONS ---
 
@@ -114,7 +160,7 @@ export function FileTable() {
     },
     move: (f?: DisboxFile) => {
       setContextMenu(null);
-      if (f) setMoveDialogFile(f);
+      if (f) setMoveDialogFiles([f]);
     },
     share: async (f?: DisboxFile) => {
       setContextMenu(null);
@@ -222,7 +268,7 @@ export function FileTable() {
           ))}
           {files.length === 0 && (
              <tr>
-               <td colSpan={3} className="px-4 py-12 text-center text-textSecondary italic">
+               <td colSpan={4} className="px-4 py-12 text-center text-textSecondary italic">
                  Dossier vide. Glissez des fichiers ici pour commencer.
                </td>
              </tr>
@@ -238,11 +284,68 @@ export function FileTable() {
         />
       )}
 
-      {moveDialogFile && (
+      {moveDialogFiles && (
         <MoveDialog 
-          file={moveDialogFile} 
-          onClose={() => setMoveDialogFile(null)} 
+          files={moveDialogFiles} 
+          onClose={() => {
+            setMoveDialogFiles(null);
+            setRowSelection({}); // Clear selection after moving
+          }} 
         />
+      )}
+
+      {/* Floating Bulk Action Bar */}
+      {selectedFiles.length > 0 && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-40 bg-surface/95 backdrop-blur-xl border border-white/10 shadow-2xl rounded-2xl flex items-center px-4 py-3 gap-4 animate-in slide-in-from-bottom-5">
+           <div className="flex items-center gap-2 border-r border-white/10 pr-4">
+              <span className="flex items-center justify-center w-6 h-6 rounded-full bg-discord text-white text-xs font-bold">{selectedFiles.length}</span>
+              <span className="text-sm font-medium hidden sm:inline">sélectionné(s)</span>
+           </div>
+           
+           <div className="flex flex-wrap sm:flex-nowrap items-center gap-2">
+              <button 
+                onClick={() => setMoveDialogFiles(selectedFiles)}
+                className="px-3 py-1.5 rounded-lg hover:bg-white/10 text-sm font-medium flex items-center gap-2 transition-colors"
+                title="Déplacer"
+              ><FolderInput className="w-4 h-4"/> <span className="hidden sm:inline">Déplacer</span></button>
+
+              <button 
+                onClick={async () => {
+                  if (!fileManager) return;
+                  const tId = toast.loading("Création du ZIP global...");
+                  try {
+                    await fileManager.downloadMultipleAsZip(selectedFiles, "Distock_Selection.zip", (done, tot) => toast.loading(`Zip: ${done}/${tot}...`, { id: tId }));
+                    toast.success("ZIP global prêt !", { id: tId });
+                    setRowSelection({});
+                  } catch(e: any) { toast.error(e.message, { id: tId }); }
+                }}
+                className="px-3 py-1.5 rounded-lg hover:bg-white/10 text-sm font-medium flex items-center gap-2 transition-colors"
+                title="Télécharger ZIP"
+              ><DownloadCloud className="w-4 h-4"/> <span className="hidden sm:inline">Télécharger</span></button>
+
+              <button 
+                onClick={async () => {
+                  if (!fileManager || !confirm(`Supprimer ${selectedFiles.length} élément(s) ?`)) return;
+                  const tId = toast.loading("Suppression globale...");
+                  try {
+                    for (const sf of selectedFiles) {
+                      if (sf.type === 'directory') await fileManager.deleteDirectoryRecursive(sf.path!);
+                      else await fileManager.deleteFile(sf.path!);
+                    }
+                    toast.success("Tout supprimé !", { id: tId });
+                    refreshFiles();
+                    setRowSelection({});
+                  } catch (err: any) { toast.error(err.message, { id: tId }); }
+                }}
+                className="px-3 py-1.5 rounded-lg hover:bg-red-500/10 text-red-400 text-sm font-medium flex items-center gap-2 transition-colors"
+                title="Supprimer"
+              ><Trash2 className="w-4 h-4"/> <span className="hidden sm:inline">Supprimer</span></button>
+
+              <button onClick={() => setRowSelection({})} className="ml-2 p-1.5 rounded-full hover:bg-white/10 text-textSecondary hover:text-white transition-colors" title="Annuler">
+                 <X className="w-4 h-4" />
+              </button>
+           </div>
+        </div>
       )}
     </div>
   );

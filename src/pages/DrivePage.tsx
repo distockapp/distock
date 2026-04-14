@@ -1,12 +1,12 @@
 import { useState, useCallback } from 'react';
 import { useDriveStore } from '../store/useDriveStore';
 import { FileTable } from '../components/FileTable';
-import { Search, Upload, FolderPlus, LogOut, ArrowLeft, RefreshCw } from 'lucide-react';
+import { Search, Upload, FolderPlus, LogOut, ArrowLeft, RefreshCw, ServerCrash } from 'lucide-react';
 import { useDropzone } from 'react-dropzone';
 import { toast } from 'sonner';
 
 export function DrivePage() {
-  const { fileManager, currentPath, setCurrentPath, setWebhookUrl, searchQuery, setSearchQuery, refreshFiles } = useDriveStore();
+  const { fileManager, currentPath, setCurrentPath, setWebhookUrl, webhookUrl, initManager, searchQuery, setSearchQuery, refreshFiles } = useDriveStore();
   const [isUploading, setIsUploading] = useState(false);
   const [progress, setProgress] = useState(0);
 
@@ -41,10 +41,8 @@ export function DrivePage() {
 
         const exactPath = builtPath ? `${builtPath}/${fileName}` : fileName;
 
-        await fileManager.uploadFile(exactPath, file, () => {
-           // We use the increment of data purely for overall progress.
-           // However it's easier to just guess or do exact math.
-           // For simplicity, we update progress after each file completes.
+        await fileManager.uploadFile(exactPath, file, (uploadedBytes, _totalBytes) => {
+           setProgress(((uploadedSize + uploadedBytes) / totalSize) * 100);
         });
         uploadedSize += file.size;
         setProgress((uploadedSize / totalSize) * 100);
@@ -52,7 +50,7 @@ export function DrivePage() {
       } catch (err) {
         console.error(err);
         errorCount++;
-        toast.error(`Échec upload: ${file.name}`);
+        toast.error(`Échec upload: ${file.name} - ${err instanceof Error ? err.message : String(err)}`);
       }
     }
     
@@ -90,20 +88,56 @@ export function DrivePage() {
 
   const breadcrumbs = currentPath.split('/').filter(Boolean);
 
+  const error = useDriveStore(s => s.error);
+  const isRetrying = useDriveStore(s => s.isLoading);
+
+  if (!fileManager) {
+    return (
+      <div className="flex flex-col items-center justify-center h-screen bg-background text-textPrimary">
+        <ServerCrash className="w-16 h-16 text-red-400 mb-6" />
+        <h2 className="text-2xl font-bold mb-2">Connexion échouée</h2>
+        <p className="text-textSecondary mb-4 text-center max-w-md">
+          {error === "SERVER_TIMEOUT"
+            ? "Le serveur met trop de temps à répondre. Il est probablement en train de démarrer (cold start). Réessayez dans quelques secondes."
+            : error
+            ? `Erreur : ${error}`
+            : "Impossible de se connecter au serveur. Vérifiez votre connexion internet et réessayez."}
+        </p>
+        <div className="flex gap-4">
+          <button 
+            onClick={() => initManager(webhookUrl!).catch(() => {})}
+            disabled={isRetrying}
+            className="bg-discord hover:bg-discordHover disabled:opacity-50 text-white px-6 py-3 rounded-xl font-medium transition-all shadow-lg flex items-center gap-2"
+          >
+            <RefreshCw className={`w-5 h-5 ${isRetrying ? 'animate-spin' : ''}`} />
+            {isRetrying ? 'Connexion...' : 'Réessayer'}
+          </button>
+          <button 
+            onClick={() => setWebhookUrl(null)}
+            className="bg-surface hover:bg-surfaceLight text-textSecondary hover:text-white px-6 py-3 rounded-xl font-medium transition-all shadow-lg flex items-center gap-2"
+          >
+            <LogOut className="w-5 h-5" />
+            Quitter
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div {...getRootProps()} className={`flex flex-col h-screen text-textPrimary bg-background transition-colors ${isDragActive ? 'bg-discord/10 border-2 border-discord border-dashed' : ''}`}>
       <input {...getInputProps()} />
       {/* Header */}
-      <header className="h-16 border-b border-white/5 bg-surface/80 flex items-center justify-between px-4">
+      <header className="py-3 px-4 border-b border-white/5 bg-surface/80 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <div className="flex items-center gap-4">
-          <div className="font-bold text-xl text-discord">Distock</div>
+          <div className="font-bold text-xl text-discord shrink-0">Distock</div>
           
-          <div className="flex items-center gap-2 overflow-x-auto whitespace-nowrap text-sm text-textSecondary select-none">
-            <span className="cursor-pointer hover:text-white" onClick={() => setCurrentPath('')}>Maison</span>
+          <div className="flex items-center gap-2 overflow-x-auto whitespace-nowrap text-sm text-textSecondary select-none" style={{ scrollbarWidth: 'none' }}>
+            <span className="cursor-pointer hover:text-white shrink-0" onClick={() => setCurrentPath('')}>Maison</span>
             {breadcrumbs.map((crumb, idx) => {
               const cp = breadcrumbs.slice(0, idx + 1).join('/');
               return (
-                <span key={cp} className="flex items-center gap-2">
+                <span key={cp} className="flex items-center gap-2 shrink-0">
                   <span>/</span>
                   <span className="cursor-pointer hover:text-white font-medium" onClick={() => setCurrentPath(cp)}>
                     {crumb}
@@ -114,37 +148,47 @@ export function DrivePage() {
           </div>
         </div>
         
-        <div className="flex items-center gap-3">
-           <div className="relative">
+        <div className="flex items-center gap-3 w-full sm:w-auto">
+           <div className="relative flex-1 sm:flex-none">
              <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-textSecondary" />
              <input type="text" placeholder="Rechercher..." 
                value={searchQuery}
                onChange={(e) => setSearchQuery(e.target.value)}
-               className="bg-background border border-white/10 rounded-full pl-9 pr-4 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-discord w-64" />
+               className="bg-background border border-white/10 rounded-full pl-9 pr-4 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-discord w-full sm:w-64" />
            </div>
            
-           <button onClick={() => refreshFiles()} className="p-2 rounded-lg hover:bg-white/5 text-textSecondary hover:text-white transition-colors" title="Actualiser">
+           <button onClick={() => refreshFiles(true)} className="p-2 rounded-lg hover:bg-white/5 text-textSecondary hover:text-white transition-colors shrink-0" title="Actualiser">
               <RefreshCw className="w-5 h-5"/>
            </button>
-           <button onClick={handleLogout} className="p-2 rounded-lg hover:bg-red-500/10 text-red-400 transition-colors" title="Déconnexion">
+           <button onClick={handleLogout} className="p-2 rounded-lg hover:bg-red-500/10 text-red-400 transition-colors shrink-0" title="Déconnexion">
               <LogOut className="w-5 h-5"/>
            </button>
         </div>
       </header>
 
       {/* Toolbar */}
-      <div className="p-4 flex items-center gap-2 border-b border-white/5">
+      <div className="p-4 flex flex-wrap items-center gap-2 border-b border-white/5">
         {currentPath && (
           <button onClick={() => setCurrentPath(currentPath.substring(0, currentPath.lastIndexOf('/')))} className="px-3 py-1.5 rounded bg-surface hover:bg-surface/80 border border-white/5 flex items-center gap-2 text-sm font-medium">
              <ArrowLeft className="w-4 h-4" /> Retour
           </button>
         )}
-        <label className="px-3 py-1.5 rounded bg-discord hover:bg-discord/90 text-white cursor-pointer flex items-center gap-2 text-sm font-medium transition-colors">
+        <label className="px-3 py-1.5 rounded border border-white/10 hover:bg-white/5 text-white cursor-pointer flex items-center gap-2 text-sm font-medium transition-colors">
           <Upload className="w-4 h-4" />
-          <span>Upload</span>
+          <span>Fichiers</span>
+          <input type="file" multiple className="hidden" onChange={(e) => {
+             if (e.target.files) {
+               const arr = Array.from(e.target.files);
+               onDrop(arr);
+               e.target.value = '';
+             }
+          }} />
+        </label>
+        <label className="px-3 py-1.5 rounded bg-discord hover:bg-discord/90 text-white cursor-pointer flex items-center gap-2 text-sm font-medium transition-colors">
+          <FolderPlus className="w-4 h-4" />
+          <span>Dossier</span>
           <input type="file" multiple className="hidden" webkitdirectory="" onChange={(e) => {
              if (e.target.files) {
-               // convert FileList to File array to match Dropzone
                const arr = Array.from(e.target.files);
                onDrop(arr);
                e.target.value = '';
@@ -153,9 +197,11 @@ export function DrivePage() {
         </label>
         <button onClick={handleCreateFolder} className="px-3 py-1.5 rounded bg-surface hover:bg-surface/80 border border-white/5 flex items-center gap-2 text-sm font-medium transition-colors">
            <FolderPlus className="w-4 h-4" />
-           <span>Nouveau Dossier</span>
+           <span className="hidden sm:inline">Nouveau Dossier</span>
+           <span className="sm:hidden">Nouveau</span>
         </button>
-        <span className="text-textSecondary text-xs ml-4">Glissez-déposez des fichiers/dossiers n'importe où.</span>
+        <div className="flex-1"></div>
+        <span className="hidden md:inline text-textSecondary text-xs">Glissez-déposez des fichiers ici.</span>
       </div>
 
       {isUploading && (

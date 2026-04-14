@@ -4,7 +4,7 @@ import { useDriveStore } from '../store/useDriveStore';
 import { Folder, X } from 'lucide-react';
 import { toast } from 'sonner';
 
-export function MoveDialog({ file, onClose }: { file: DisboxFile, onClose: () => void }) {
+export function MoveDialog({ files, onClose }: { files: DisboxFile[], onClose: () => void }) {
   const { fileManager, refreshFiles } = useDriveStore();
   const [targetPath, setTargetPath] = useState('');
   const [dirs, setDirs] = useState<{ path: string, name: string, depth: number }[]>([]);
@@ -15,10 +15,11 @@ export function MoveDialog({ file, onClose }: { file: DisboxFile, onClose: () =>
     const flattenDirs = (f: DisboxFile, p: string, depth: number): {path: string, name: string, depth: number}[] => {
       let d: {path: string, name: string, depth: number}[] = [];
       if (f.type === 'directory') {
-         if (p !== file.path) { // cannot move inside itself
+         // Cannot move inside itself or any of the selected moving folders
+         if (!files.some(mf => mf.path === p)) {
            d.push({ path: p, name: f.name || 'Maison', depth });
          }
-         if (f.children && p !== file.path) { // prevent listing children of the moved folder to avoid cyclic moves
+         if (f.children && !files.some(mf => mf.path === p)) {
            Object.values(f.children).forEach(child => {
              d = d.concat(flattenDirs(child, p ? `${p}/${child.name}` : child.name, depth + 1));
            });
@@ -33,13 +34,15 @@ export function MoveDialog({ file, onClose }: { file: DisboxFile, onClose: () =>
        allDirs = allDirs.concat(flattenDirs(c, c.name, 1));
     });
     setDirs(allDirs);
-  }, [fileManager, file.path]);
+  }, [fileManager, files]);
 
   const handleMove = async () => {
-    if (!fileManager || !file.path) return;
+    if (!fileManager || files.length === 0) return;
     try {
-      await fileManager.moveFile(file.path, targetPath);
-      toast.success(`${file.name} déplacé avec succès`);
+      for (const f of files) {
+        if (f.path) await fileManager.moveFile(f.path, targetPath);
+      }
+      toast.success(`${files.length} élément(s) déplacé(s) avec succès`);
       refreshFiles();
       onClose();
     } catch(e: any) {
@@ -51,7 +54,7 @@ export function MoveDialog({ file, onClose }: { file: DisboxFile, onClose: () =>
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
       <div className="bg-surface border border-white/10 rounded-xl w-full max-w-md shadow-2xl flex flex-col max-h-[80vh]">
         <div className="flex justify-between items-center p-4 border-b border-white/5">
-          <h3 className="font-semibold text-lg">Déplacer {file.name} vers...</h3>
+          <h3 className="font-semibold text-lg">Déplacer {files.length} élément(s) vers...</h3>
           <button onClick={onClose} className="p-1 hover:bg-white/10 rounded text-textSecondary hover:text-white"><X className="w-5 h-5"/></button>
         </div>
         

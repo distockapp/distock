@@ -25,7 +25,7 @@ export function LandingPage() {
         <div className="text-2xl font-bold bg-gradient-to-r from-discord to-indigo-400 bg-clip-text text-transparent">
           Distock
         </div>
-        <a href="https://github.com/DisboxApp/web" className="text-sm text-textSecondary hover:text-white">Github</a>
+        <a href="https://github.com/distockapp/distock" target="_blank" rel="noopener noreferrer" className="text-sm text-textSecondary hover:text-white">Github</a>
       </nav>
 
       <main className="flex-1 flex flex-col items-center justify-center p-8 text-center max-w-4xl mx-auto">
@@ -44,7 +44,7 @@ export function LandingPage() {
               <li>Créez un serveur Discord privé.</li>
               <li>Allez dans Paramètres du Serveur {">"} Intégrations {">"} Webhooks.</li>
               <li>Cliquez sur Créer, puis Copier l'URL du Webhook.</li>
-              <li>Collez l'URL ci-dessous. Elle sera hachée et ne quittera jamais votre appareil en l'état.</li>
+              <li>Collez l'URL ci-dessous. Par mesure de sécurité, elle est chiffrée localement : personne d'autre n'y aura jamais accès.</li>
             </ol>
           </div>
           <input
