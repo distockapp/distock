@@ -11,6 +11,10 @@ export function DrivePage() {
   const [isUploading, setIsUploading] = useState(false);
   const [progress, setProgress] = useState(0);
 
+  const [showNewFolderDialog, setShowNewFolderDialog] = useState(false);
+  const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
+  const [newFolderName, setNewFolderName] = useState("");
+
   const onDrop = useCallback(async (acceptedFiles: File[]) => {
     if (!fileManager) return;
     setIsUploading(true);
@@ -63,17 +67,23 @@ export function DrivePage() {
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({ onDrop, noClick: true });
 
-  const handleCreateFolder = async () => {
+  const handleCreateFolder = () => {
     if (!fileManager) return;
-    const name = window.prompt("Nom du nouveau dossier ?");
-    if (!name?.trim()) return;
+    setNewFolderName("");
+    setShowNewFolderDialog(true);
+  };
+
+  const handleCreateFolderSubmit = async () => {
+    const name = newFolderName.trim();
+    if (!name) return;
     if (name.includes("/")) {
       toast.error("Le nom ne peut pas contenir '/'");
       return;
     }
+    setShowNewFolderDialog(false);
     try {
       const path = currentPath ? `${currentPath}/${name}` : name;
-      await fileManager.createDirectory(path);
+      await fileManager!.createDirectory(path);
       refreshFiles();
       toast.success("Dossier créé");
     } catch(e: any) {
@@ -82,9 +92,7 @@ export function DrivePage() {
   };
 
   const handleLogout = () => {
-    if (confirm("Se déconnecter ? Le webhook sera oublié.")) {
-      setWebhookUrl(null);
-    }
+    setShowLogoutConfirm(true);
   };
 
   const breadcrumbs = currentPath.split('/').filter(Boolean);
@@ -227,6 +235,45 @@ export function DrivePage() {
       
       {/* Mobile Footer Spacing if needed */}
       <div className="md:hidden h-16"/>
+
+      {/* Modals */}
+      {showNewFolderDialog && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-surface border border-white/10 rounded-xl p-6 w-full max-w-sm shadow-2xl">
+            <h3 className="text-lg font-bold text-white mb-4">Nouveau Dossier</h3>
+            <input 
+              type="text" 
+              value={newFolderName}
+              onChange={e => setNewFolderName(e.target.value)}
+              placeholder="Nom du dossier"
+              className="w-full bg-background border border-white/10 rounded-lg px-3 py-2 text-white focus:outline-none focus:ring-1 focus:ring-discord mb-6" 
+              autoFocus 
+              onKeyDown={(e) => {
+                 if (e.key === 'Enter') handleCreateFolderSubmit();
+              }}
+            />
+            <div className="flex justify-end gap-3">
+              <button onClick={() => setShowNewFolderDialog(false)} className="px-4 py-2 rounded-lg text-textSecondary hover:text-white hover:bg-white/5 transition-colors">Annuler</button>
+              <button onClick={handleCreateFolderSubmit} className="px-4 py-2 rounded-lg bg-discord hover:bg-discordHover text-white font-medium transition-colors">
+                Créer
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showLogoutConfirm && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-surface border border-white/10 rounded-xl p-6 w-full max-w-sm shadow-2xl">
+            <h3 className="text-lg font-bold text-white mb-2">Se déconnecter</h3>
+            <p className="text-textSecondary text-sm mb-6">Êtes-vous sûr de vouloir vous déconnecter ? Le webhook sera oublié.</p>
+            <div className="flex justify-end gap-3">
+              <button onClick={() => setShowLogoutConfirm(false)} className="px-4 py-2 rounded-lg text-textSecondary hover:text-white hover:bg-white/5 transition-colors">Annuler</button>
+              <button onClick={() => { setShowLogoutConfirm(false); setWebhookUrl(null); }} className="px-4 py-2 rounded-lg bg-red-500/80 hover:bg-red-500 text-white font-medium transition-colors">Déconnexion</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
