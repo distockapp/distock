@@ -11,11 +11,18 @@ export function LandingPage() {
 
   const handleSetup = (e: FormEvent) => {
     e.preventDefault();
-    if (!webhook.trim() || (!webhook.includes('discord.com') && !webhook.includes('discordapp.com'))) {
-      alert("URL invalide.");
-      return;
+    const rawUrls = webhook.split(/[\n, ]+/).map(s => s.trim()).filter(Boolean);
+    if (rawUrls.length === 0) {
+       alert("Veuillez entrer au moins une URL.");
+       return;
     }
-    setWebhookUrl(webhook.trim());
+    for (const url of rawUrls) {
+      if (!url.includes('discord.com') && !url.includes('discordapp.com')) {
+        alert("Une ou plusieurs URLs sont invalides : " + url);
+        return;
+      }
+    }
+    setWebhookUrl(rawUrls.join(','));
     navigate('/drive');
   };
 
@@ -47,13 +54,12 @@ export function LandingPage() {
               <li>Collez l'URL ci-dessous. Par mesure de sécurité, elle est chiffrée localement : personne d'autre n'y aura jamais accès.</li>
             </ol>
           </div>
-          <input
-            type="password"
-            value={webhook}
-            onChange={(e) => setWebhook(e.target.value)}
-            placeholder="https://discord.com/api/webhooks/..."
-            className="w-full bg-background border border-white/10 rounded-lg px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-discord transition-all mb-4"
-          />
+            <textarea
+              value={webhook}
+              onChange={(e) => setWebhook(e.target.value)}
+              placeholder="https://discord.com/api/webhooks/...\nhttps://discord.com/api/webhooks/..."
+              className="w-full h-32 bg-background border border-white/10 rounded-lg px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-discord transition-all mb-4 resize-y"
+            />
           <button type="submit" disabled={!webhook} className="w-full bg-discord hover:bg-discord/80 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold py-3 rounded-lg transition-colors">
             Accéder au Drive
           </button>

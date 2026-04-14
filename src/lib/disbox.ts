@@ -157,18 +157,31 @@ export async function fetchProxiedChunk(url: string): Promise<Blob> {
 }
 
 class DiscordFileStorage {
-  private webhookClient: DiscordWebhookClient;
+  private webhookClients: DiscordWebhookClient[] = [];
+  private currentUploadIndex = 0;
 
-  constructor(webhookUrl: string) {
-    this.webhookClient = new DiscordWebhookClient(webhookUrl);
+  constructor(webhookUrls: string[]) {
+    this.webhookClients = webhookUrls.map(url => new DiscordWebhookClient(url));
   }
 
   async getAttachmentUrls(messageIds: string[]): Promise<string[]> {
     const urls: string[] = [];
     for (const id of messageIds) {
-      const msg = await this.webhookClient.getMessage(id);
-      if (msg && msg.attachments && msg.attachments[0]) {
-        urls.push(msg.attachments[0].url);
+      let found = false;
+      for (const client of this.webhookClients) {
+        try {
+          const msg = await client.getMessage(id);
+          if (msg && msg.attachments && msg.attachments[0]) {
+            urls.push(msg.attachments[0].url);
+            found = true;
+            break; // found it
+          }
+        } catch(e) {
+          // ignore error, try next client
+        }
+      }
+      if (!found) {
+        console.warn(`[Disbox] Message ${id} not found across all ${this.webhookClients.length} datanodes`);
       }
     }
     return urls;
@@ -211,7 +224,11 @@ class DiscordFileStorage {
           formData.append('payload_json', JSON.stringify({}));
           formData.append('file', chunkBlob, `${namePrefix}_chunk_${ids.length}`);
 
-          const response = await this.webhookClient.fetchWithRateLimit('?wait=true', {
+          // Rotation du client pour répartir la charge temporelle et IP (Load Balancer)
+          const targetClient = this.webhookClients[this.currentUploadIndex % this.webhookClients.length];
+          this.currentUploadIndex++;
+
+          const response = await targetClient.fetchWithRateLimit('?wait=true', {
             method: 'POST',
             body: formData,
             signal: controller.signal
@@ -279,9 +296,8 @@ class DiscordFileStorage {
   async delete(messageIds: string[], onProgress?: ProgressCallback) {
     let deleted = 0;
     for (const id of messageIds) {
-      await this.webhookClient.deleteMessage(id).catch((e) => {
-        console.error(`Failed to delete message ${id}`, e);
-      });
+      // Broadcast delete to all clients since we don't know who owns it
+      await Promise.all(this.webhookClients.map(client => client.deleteMessage(id).catch(() => {})));
       deleted++;
       if (onProgress) onProgress(deleted, messageIds.length);
     }
@@ -293,12 +309,17 @@ export class DisboxFileManager {
   discordFileStorage: DiscordFileStorage;
   fileTree: DisboxTree;
 
-  static async create(webhookUrl: string): Promise<DisboxFileManager> {
+  static async create(webhookUrlRaw: string): Promise<DisboxFileManager> {
+    const urls = webhookUrlRaw.split(',').map(s => s.trim()).filter(Boolean);
+    if (urls.length === 0) throw new Error("No webhook provided");
+    
+    // Le NameNode (Maître) est la première URL. Il détient l'arborescence.
+    const masterWebhook = urls[0];
     const hostnames = ["discord.com", "discordapp.com"];
     
     // Fetch both in parallel to save time
     const results = await Promise.allSettled(hostnames.map(async (hostname) => {
-      const fetchUrl = new URL(webhookUrl);
+      const fetchUrl = new URL(masterWebhook);
       fetchUrl.hostname = hostname;
       const hashed = sha256(fetchUrl.href);
 
@@ -346,7 +367,7 @@ export class DisboxFileManager {
       return lenB - lenA;
     })[0];
     
-    return new DisboxFileManager(sha256(chosenUrl), new DiscordFileStorage(webhookUrl), fileTree as DisboxTree);
+    return new DisboxFileManager(sha256(chosenUrl), new DiscordFileStorage(urls), fileTree as DisboxTree);
   }
 
 
