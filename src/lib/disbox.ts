@@ -178,43 +178,59 @@ class DiscordFileStorage {
       if (abortSignal?.aborted) throw new Error("Upload aborted");
       
       const chunkBlob = sourceFile.slice(i, i + CHUNK_SIZE);
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 300_000); // 5 min timeout
       
-      if (abortSignal) {
-         abortSignal.addEventListener('abort', () => controller.abort());
-      }
-      
-      try {
-        const formData = new FormData();
-        formData.append('payload_json', JSON.stringify({}));
-        formData.append('file', chunkBlob, `${namePrefix}_chunk_${ids.length}`);
+      let attempts = 0;
+      let success = false;
+      let lastErr: any = null;
 
-        // We bypass the webhookClient sendAttachment because we want explicit timeout and signal proxy support here directly
-        const response = await this.webhookClient.fetchWithRateLimit('?wait=true', {
-          method: 'POST',
-          body: formData,
-          signal: controller.signal
-        });
+      while (attempts < 5 && !success) {
+        if (abortSignal?.aborted) throw new Error("Upload aborted");
+        attempts++;
         
-        clearTimeout(timeout);
-        const data = await response.json();
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 300_000); // 5 min timeout
         
-        // Wait for attachment to settle (Discord propagation)
-        await new Promise(r => setTimeout(r, 650));
-        
-        ids.push(data.id);
-        uploadedBytes += chunkBlob.size;
-        
-        if (onProgress) {
-          onProgress(uploadedBytes, sourceFile.size);
+        if (abortSignal) {
+           abortSignal.addEventListener('abort', () => controller.abort());
         }
-      } catch (err: any) {
-        clearTimeout(timeout);
-        if (err.name === 'AbortError') {
-          throw new Error('Timeout upload — vérifiez votre connexion.');
+        
+        try {
+          const formData = new FormData();
+          formData.append('payload_json', JSON.stringify({}));
+          formData.append('file', chunkBlob, `${namePrefix}_chunk_${ids.length}`);
+
+          const response = await this.webhookClient.fetchWithRateLimit('?wait=true', {
+            method: 'POST',
+            body: formData,
+            signal: controller.signal
+          });
+          
+          clearTimeout(timeout);
+          const data = await response.json();
+          
+          await new Promise(r => setTimeout(r, 650));
+          
+          ids.push(data.id);
+          uploadedBytes += chunkBlob.size;
+          
+          if (onProgress) {
+            onProgress(uploadedBytes, sourceFile.size);
+          }
+          success = true;
+        } catch (err: any) {
+          clearTimeout(timeout);
+          lastErr = err;
+          if (err.name === 'AbortError' && abortSignal?.aborted) {
+             throw new Error('Upload annulé.');
+          }
+          console.warn(`Upload chunk attempt ${attempts} failed:`, err);
+          if (attempts < 5) {
+             await new Promise(r => setTimeout(r, 2000 * attempts)); // Exponential backoff waiting 2, 4, 6, 8s
+          }
         }
-        throw err;
+      }
+      if (!success) {
+         throw lastErr;
       }
     }
     return ids;
