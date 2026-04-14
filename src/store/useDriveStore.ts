@@ -7,6 +7,7 @@ interface DriveState {
   fileManager: DisboxFileManager | null;
   currentPath: string;
   files: DisboxFile[];
+  totalSize: number;
   isLoading: boolean;
   error: string | null;
   searchQuery: string;
@@ -24,6 +25,7 @@ export const useDriveStore = create<DriveState>((set, get) => ({
   fileManager: null,
   currentPath: '',
   files: [],
+  totalSize: 0,
   isLoading: false,
   error: null,
   searchQuery: '',
@@ -75,6 +77,13 @@ export const useDriveStore = create<DriveState>((set, get) => ({
     }
     
     let resultFiles: DisboxFile[] = [];
+    let newTotalSize = 0;
+
+    const calcSize = (f: DisboxFile) => {
+      if (f.type === 'file') newTotalSize += (f.size || 0);
+      else if (f.children) Object.values(f.children).forEach(calcSize);
+    };
+    if (fileManager.fileTree) calcSize(fileManager.fileTree);
 
     if (searchQuery) {
       // Very basic flat search across everything
@@ -106,6 +115,6 @@ export const useDriveStore = create<DriveState>((set, get) => ({
       }
     }
 
-    set({ files: resultFiles });
+    set({ files: resultFiles, totalSize: newTotalSize });
   }
 }));

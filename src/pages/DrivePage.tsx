@@ -1,12 +1,13 @@
 import { useState, useCallback } from 'react';
 import { useDriveStore } from '../store/useDriveStore';
 import { FileTable } from '../components/FileTable';
-import { Search, Upload, FolderPlus, LogOut, ArrowLeft, RefreshCw, ServerCrash } from 'lucide-react';
+import { Search, Upload, FolderPlus, LogOut, ArrowLeft, RefreshCw, ServerCrash, Cloud } from 'lucide-react';
 import { useDropzone } from 'react-dropzone';
 import { toast } from 'sonner';
+import { formatSize } from '../lib/utils';
 
 export function DrivePage() {
-  const { fileManager, currentPath, setCurrentPath, setWebhookUrl, webhookUrl, initManager, searchQuery, setSearchQuery, refreshFiles } = useDriveStore();
+  const { fileManager, currentPath, setCurrentPath, setWebhookUrl, webhookUrl, initManager, searchQuery, setSearchQuery, refreshFiles, totalSize } = useDriveStore();
   const [isUploading, setIsUploading] = useState(false);
   const [progress, setProgress] = useState(0);
 
@@ -149,6 +150,11 @@ export function DrivePage() {
         </div>
         
         <div className="flex items-center gap-3 w-full sm:w-auto">
+           <div className="hidden sm:flex items-center gap-2 text-xs font-medium text-textSecondary bg-white/5 px-3 py-1.5 rounded-full border border-white/5 whitespace-nowrap">
+             <Cloud className="w-4 h-4 text-discord" />
+             <span className="text-white">{formatSize(totalSize)}</span> / Illimité
+           </div>
+           
            <div className="relative flex-1 sm:flex-none">
              <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-textSecondary" />
              <input type="text" placeholder="Rechercher..." 
