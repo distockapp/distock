@@ -134,6 +134,19 @@ class DiscordWebhookClient {
 }
 
 export async function fetchProxiedChunk(url: string): Promise<Blob> {
+  // Si l'extension Chrome Distock est installée, elle gère les headers CORS.
+  // On peut donc tenter le CDN direct sans proxy.
+  const hasExtension = typeof window !== 'undefined' && (window as any).__DISTOCK_EXTENSION__ === true;
+
+  if (hasExtension) {
+    try {
+      const response = await fetch(url);
+      if (response.ok) return await response.blob();
+    } catch (e) {
+      console.warn('[Distock] Extension détectée mais fetch direct a échoué, repli sur proxy.', e);
+    }
+  }
+
   const proxies = [
     url, // Direct CDN (might work if CORS allows)
     `https://corsproxy.io/?${encodeURIComponent(url)}`,
@@ -151,6 +164,7 @@ export async function fetchProxiedChunk(url: string): Promise<Blob> {
     } catch (e) {
       console.warn(`Proxy failed: ${proxyUrl}`, e);
       lastError = e;
+
     }
   }
   throw new Error(lastError instanceof Error ? lastError.message : String(lastError));
