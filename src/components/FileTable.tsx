@@ -35,6 +35,9 @@ export function FileTable() {
   const [rowSelection, setRowSelection] = useState({});
   const [contextMenu, setContextMenu] = useState<{ x: number, y: number, file?: DisboxFile } | null>(null);
   const [moveDialogFiles, setMoveDialogFiles] = useState<DisboxFile[] | null>(null);
+  const [renameDialog, setRenameDialog] = useState<DisboxFile | null>(null);
+  const [propertiesDialog, setPropertiesDialog] = useState<DisboxFile | null>(null);
+  const [deleteConfirm, setDeleteConfirm] = useState<DisboxFile | null>(null);
 
   const columns = useMemo<ColumnDef<DisboxFile>[]>(() => [
     {
@@ -127,36 +130,13 @@ export function FileTable() {
 
   const actions = {
     open: handleOpen,
-    rename: async (f?: DisboxFile) => {
+    rename: (f?: DisboxFile) => {
       setContextMenu(null);
-      if (!f || !fileManager) return;
-      const newName = window.prompt("Nouveau nom:", f.name);
-      if (!newName || newName === f.name) return;
-      try {
-        await fileManager.renameFile(f.path!, newName);
-        toast.success("Renommé avec succès");
-        refreshFiles();
-      } catch(e: any) { toast.error(e.message); }
+      if (f) setRenameDialog(f);
     },
-    delete: async (f?: DisboxFile) => {
+    delete: (f?: DisboxFile) => {
       setContextMenu(null);
-      if (!f || !fileManager) return;
-      if (!confirm(`Supprimer ${f.name} définitivement ?`)) return;
-      
-      const tId = toast.loading("Suppression en cours...");
-      try {
-        if (f.type === 'directory') {
-          await fileManager.deleteDirectoryRecursive(f.path!, (del, tot) => {
-             toast.loading(`Suppression... ${del}/${tot}`, { id: tId });
-          });
-        } else {
-          await fileManager.deleteFile(f.path!);
-        }
-        toast.success("Supprimé !", { id: tId });
-        refreshFiles();
-      } catch(e: any) { 
-        toast.error(`Erreur: ${e.message}`, { id: tId }); 
-      }
+      if (f) setDeleteConfirm(f);
     },
     move: (f?: DisboxFile) => {
       setContextMenu(null);
@@ -165,13 +145,12 @@ export function FileTable() {
     share: async (f?: DisboxFile) => {
       setContextMenu(null);
       if (!f || !fileManager || f.type === 'directory') return;
-      if (!confirm("Créer un lien de partage public ?")) return;
       try {
          const urls = await fileManager.getAttachmentUrls(f.path!);
          const encoded = btoa(String.fromCharCode.apply(null, Array.from(pako.deflate(JSON.stringify(urls)))))
             .replace(/\+/g, '~').replace(/\//g, '_').replace(/=/g, '-');
          
-         const url = `${window.location.origin}${window.location.pathname}?name=${encodeURIComponent(f.name)}&size=${f.size}#${encoded}`;
+         const url = `${window.location.origin}${window.location.pathname}#/share?name=${encodeURIComponent(f.name)}&size=${f.size}&data=${encoded}`;
          await navigator.clipboard.writeText(url);
          toast.success("Lien de partage copié dans le presse-papier");
       } catch(e: any) {
@@ -229,8 +208,7 @@ export function FileTable() {
     },
     properties: (f?: DisboxFile) => {
        setContextMenu(null);
-       if (!f) return;
-       alert(`Propriétés:\nNom: ${f.name}\nTaille: ${formatSize(f.size)}\nCréé le: ${new Date(f.created_at).toLocaleString()}`);
+       if (f) setPropertiesDialog(f);
     }
   };
 
@@ -363,6 +341,106 @@ export function FileTable() {
            </div>
         </div>
       )}
+      {renameDialog && (
+        <RenameDialog 
+          file={renameDialog} 
+          onClose={() => setRenameDialog(null)} 
+          onRename={async (newName) => {
+            if (!fileManager || newName === renameDialog.name) return;
+            try {
+              await fileManager.renameFile(renameDialog.path!, newName);
+              toast.success("Renommé avec succès");
+              refreshFiles();
+            } catch(e: any) { toast.error(e.message); }
+          }} 
+        />
+      )}
+      
+      {deleteConfirm && (
+        <ConfirmDialog 
+          title="Supprimer le fichier"
+          message={`Supprimer ${deleteConfirm.name} définitivement ?`}
+          onClose={() => setDeleteConfirm(null)} 
+          onConfirm={async () => {
+            if (!fileManager) return;
+            const f = deleteConfirm;
+            const tId = toast.loading("Suppression en cours...");
+            try {
+              if (f.type === 'directory') {
+                await fileManager.deleteDirectoryRecursive(f.path!, (del, tot) => {
+                   toast.loading(`Suppression... ${del}/${tot}`, { id: tId });
+                });
+              } else {
+                await fileManager.deleteFile(f.path!);
+              }
+              toast.success("Supprimé !", { id: tId });
+              refreshFiles();
+            } catch(e: any) { 
+              toast.error(`Erreur: ${e.message}`, { id: tId }); 
+            }
+          }} 
+        />
+      )}
+
+      {propertiesDialog && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-surface border border-white/10 rounded-xl p-6 w-full max-w-sm shadow-2xl">
+            <h3 className="text-lg font-bold text-white mb-4">Propriétés</h3>
+            <div className="space-y-3 text-sm text-textSecondary mb-6">
+               <p><strong className="text-white">Nom :</strong> <span className="break-all">{propertiesDialog.name}</span></p>
+               <p><strong className="text-white">Taille :</strong> {formatSize(propertiesDialog.size)}</p>
+               <p><strong className="text-white">Créé le :</strong> {new Date(propertiesDialog.created_at).toLocaleString()}</p>
+            </div>
+            <div className="flex justify-end gap-3">
+              <button onClick={() => setPropertiesDialog(null)} className="px-4 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-white font-medium transition-colors">Fermer</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RenameDialog({ file, onClose, onRename }: { file: DisboxFile, onClose: () => void, onRename: (n: string) => Promise<void> }) {
+  const [val, setVal] = useState(file.name);
+  const [loading, setLoading] = useState(false);
+  
+  return (
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+      <div className="bg-surface border border-white/10 rounded-xl p-6 w-full max-w-sm shadow-2xl">
+        <h3 className="text-lg font-bold text-white mb-4">Renommer</h3>
+        <input 
+          type="text" 
+          value={val} 
+          onChange={e => setVal(e.target.value)} 
+          className="w-full bg-background border border-white/10 rounded-lg px-3 py-2 text-white focus:outline-none focus:ring-1 focus:ring-discord mb-6" 
+          autoFocus 
+          onKeyDown={(e) => {
+             if (e.key === 'Enter') { setLoading(true); onRename(val).then(onClose).finally(() => setLoading(false)); }
+          }}
+        />
+        <div className="flex justify-end gap-3">
+          <button onClick={onClose} disabled={loading} className="px-4 py-2 rounded-lg text-textSecondary hover:text-white hover:bg-white/5 transition-colors">Annuler</button>
+          <button onClick={() => { setLoading(true); onRename(val).then(onClose).finally(() => setLoading(false)); }} disabled={loading} className="px-4 py-2 rounded-lg bg-discord hover:bg-discordHover text-white font-medium transition-colors">
+            {loading ? 'Renommage...' : 'Renommer'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ConfirmDialog({ title, message, onClose, onConfirm }: { title: string, message: string, onClose: () => void, onConfirm: () => void }) {
+  return (
+    <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+      <div className="bg-surface border border-white/10 rounded-xl p-6 w-full max-w-sm shadow-2xl">
+        <h3 className="text-lg font-bold text-white mb-2">{title}</h3>
+        <p className="text-textSecondary text-sm mb-6">{message}</p>
+        <div className="flex justify-end gap-3">
+          <button onClick={onClose} className="px-4 py-2 rounded-lg text-textSecondary hover:text-white hover:bg-white/5 transition-colors">Annuler</button>
+          <button onClick={() => { onConfirm(); onClose(); }} className="px-4 py-2 rounded-lg bg-red-500/80 hover:bg-red-500 text-white font-medium transition-colors">Confirmer</button>
+        </div>
+      </div>
     </div>
   );
 }

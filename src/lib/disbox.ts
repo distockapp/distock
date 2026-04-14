@@ -129,6 +129,29 @@ class DiscordWebhookClient {
   }
 }
 
+export async function fetchProxiedChunk(url: string): Promise<Blob> {
+  const proxies = [
+    url, // Direct CDN (might work if CORS allows)
+    `https://corsproxy.io/?${encodeURIComponent(url)}`,
+    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`
+  ];
+  
+  let lastError: any = null;
+  for (const proxyUrl of proxies) {
+    try {
+      const response = await fetch(proxyUrl);
+      if (!response.ok) throw new Error(`Proxy HTTP ${response.status}`);
+      // Await full blob to catch premature TCP cutoffs by proxies before writing to disk
+      return await response.blob();
+    } catch (e) {
+      console.warn(`Proxy failed: ${proxyUrl}`, e);
+      lastError = e;
+    }
+  }
+  throw new Error(lastError instanceof Error ? lastError.message : String(lastError));
+}
+
 class DiscordFileStorage {
   private webhookClient: DiscordWebhookClient;
 
@@ -197,28 +220,6 @@ class DiscordFileStorage {
     return ids;
   }
 
-  async fetchProxiedChunk(url: string): Promise<Blob> {
-    const proxies = [
-      url, // Direct CDN (might work if CORS allows)
-      `https://corsproxy.io/?${encodeURIComponent(url)}`,
-      `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
-      `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`
-    ];
-    
-    let lastError: any = null;
-    for (const proxyUrl of proxies) {
-      try {
-        const response = await fetch(proxyUrl);
-        if (!response.ok) throw new Error(`Proxy HTTP ${response.status}`);
-        // Await full blob to catch premature TCP cutoffs by proxies before writing to disk
-        return await response.blob();
-      } catch (e) {
-        console.warn(`Proxy failed: ${proxyUrl}`, e);
-        lastError = e;
-      }
-    }
-    throw new Error(lastError instanceof Error ? lastError.message : String(lastError));
-  }
 
   async download(messageIds: string[], writeStream: WritableStreamDefaultWriter, onProgress?: ProgressCallback, fileSize = -1): Promise<void> {
     const urls = await this.getAttachmentUrls(messageIds);
@@ -226,7 +227,7 @@ class DiscordFileStorage {
     if (onProgress) onProgress(0, fileSize);
 
     for (const url of urls) {
-      const chunkBlob = await this.fetchProxiedChunk(url);
+      const chunkBlob = await fetchProxiedChunk(url);
       const chunkData = new Uint8Array(await chunkBlob.arrayBuffer());
       await writeStream.write(chunkData);
       
@@ -595,7 +596,7 @@ export class DisboxFileManager {
       const fileBlobParts: Blob[] = [];
       
       for (const url of urls) {
-        const chunkBlob = await this.discordFileStorage.fetchProxiedChunk(url);
+        const chunkBlob = await fetchProxiedChunk(url);
         fileBlobParts.push(chunkBlob);
       }
       
@@ -648,7 +649,7 @@ export class DisboxFileManager {
       const fileBlobParts: Blob[] = [];
       
       for (const url of urls) {
-        const chunkBlob = await this.discordFileStorage.fetchProxiedChunk(url);
+        const chunkBlob = await fetchProxiedChunk(url);
         fileBlobParts.push(chunkBlob);
       }
       

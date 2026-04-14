@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { Toaster, toast } from 'sonner';
 import { LandingPage } from './pages/LandingPage';
 import { DrivePage } from './pages/DrivePage';
+import { SharePage } from './pages/SharePage';
 import { useDriveStore } from './store/useDriveStore';
 
 const queryClient = new QueryClient();
@@ -77,6 +78,7 @@ export default function App() {
         <Routes>
           <Route path="/" element={webhookUrl ? <Navigate to="/drive" /> : <LandingPage />} />
           <Route path="/drive/*" element={<ProtectedRoute><DrivePage /></ProtectedRoute>} />
+          <Route path="/share" element={<SharePage />} />
         </Routes>
       </HashRouter>
       <Toaster theme="dark" richColors position="bottom-right" />
