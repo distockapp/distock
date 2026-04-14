@@ -15,7 +15,7 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
 }
 
 export default function App() {
-  const { webhookUrl, initManager, isLoading, error, fileManager } = useDriveStore();
+  const { webhookUrl, initManager, isLoading, fileManager } = useDriveStore();
   const [showSlowWarning, setShowSlowWarning] = useState(false);
 
   useEffect(() => {

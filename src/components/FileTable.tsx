@@ -183,17 +183,33 @@ export function FileTable() {
       if (!f || !fileManager) return;
       try {
         // @ts-ignore fallback checking if showSaveFilePicker exists
-        if (!window.showSaveFilePicker) {
-          toast.error("Votre navigateur ne supporte pas le téléchargement direct."); return;
+        if (window.showSaveFilePicker) {
+          // @ts-ignore
+          const handle = await window.showSaveFilePicker({ suggestedName: f.name });
+          const writable = await handle.createWritable();
+          const t = toast.loading(`Téléchargement de ${f.name}`);
+          await fileManager.downloadFile(f.path!, writable, () => {});
+          toast.success("Téléchargement terminé", { id: t });
+        } else {
+          // Fallback for Firefox/Safari: collect chunks into a blob
+          const t = toast.loading(`Téléchargement de ${f.name}`);
+          const chunks: ArrayBuffer[] = [];
+          const writableStream = new WritableStream<Uint8Array>({
+            write(chunk) { chunks.push((chunk.buffer as ArrayBuffer).slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength)); }
+          });
+          const writer = writableStream.getWriter();
+          await fileManager.downloadFile(f.path!, writer, () => {});
+          const blob = new Blob(chunks);
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = f.name;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+          toast.success("Téléchargement terminé", { id: t });
         }
-        // @ts-ignore
-        const handle = await window.showSaveFilePicker({ suggestedName: f.name });
-        const writable = await handle.createWritable();
-        const t = toast.loading(`Téléchargement de ${f.name}`);
-        await fileManager.downloadFile(f.path!, writable, () => {
-           // For big files, we could update toast, but throttling is needed.
-        });
-        toast.success("Téléchargement terminé", { id: t });
       } catch(e: any) {
         if (e.name !== 'AbortError') toast.error(`Erreur: ${e.message}`);
       }
@@ -268,7 +284,7 @@ export function FileTable() {
           ))}
           {files.length === 0 && (
              <tr>
-               <td colSpan={4} className="px-4 py-12 text-center text-textSecondary italic">
+               <td colSpan={5} className="px-4 py-12 text-center text-textSecondary italic">
                  Dossier vide. Glissez des fichiers ici pour commencer.
                </td>
              </tr>
