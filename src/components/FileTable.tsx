@@ -38,6 +38,7 @@ export function FileTable() {
   const [renameDialog, setRenameDialog] = useState<DisboxFile | null>(null);
   const [propertiesDialog, setPropertiesDialog] = useState<DisboxFile | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<DisboxFile | null>(null);
+  const [bulkDeleteConfirm, setBulkDeleteConfirm] = useState<boolean>(false);
 
   const columns = useMemo<ColumnDef<DisboxFile>[]>(() => [
     {
@@ -144,17 +145,62 @@ export function FileTable() {
     },
     share: async (f?: DisboxFile) => {
       setContextMenu(null);
-      if (!f || !fileManager || f.type === 'directory') return;
+      if (!f || !fileManager) return;
+      
+      const tId = toast.loading("Génération du lien de partage...");
       try {
-         const urls = await fileManager.getAttachmentUrls(f.path!);
-         const encoded = btoa(String.fromCharCode.apply(null, Array.from(pako.deflate(JSON.stringify(urls)))))
-            .replace(/\+/g, '~').replace(/\//g, '_').replace(/=/g, '-');
-         
-         const url = `${window.location.origin}${window.location.pathname}#/share?name=${encodeURIComponent(f.name)}&size=${f.size}&data=${encoded}`;
-         await navigator.clipboard.writeText(url);
-         toast.success("Lien de partage copié dans le presse-papier");
+         if (f.type === 'directory') {
+            toast.loading("Génération du manifeste (scan du dossier)...", { id: tId });
+            
+            const collectFiles = async (node: DisboxFile, curPath: string) => {
+               const list: any[] = [];
+               for (const child of Object.values(node.children || {})) {
+                  const childPath = curPath ? `${curPath}/${child.name}` : child.name;
+                  if (child.type === 'file') {
+                     const urls = await fileManager.getAttachmentUrls(child.path!);
+                     list.push({ path: childPath, name: child.name, size: child.size, type: 'file', urls });
+                  } else {
+                     list.push(...await collectFiles(child, childPath));
+                  }
+               }
+               return list;
+            };
+            
+            const flatFiles = await collectFiles(f, "");
+            const totalSize = flatFiles.reduce((acc, curr) => acc + (curr.size || 0), 0);
+            
+            const manifestData = {
+               manifestVersion: 1,
+               type: 'directory',
+               name: f.name,
+               size: totalSize,
+               files: flatFiles
+            };
+            
+            toast.loading("Transfert de l'URL du dossier au nuage...", { id: tId });
+            
+            const compressed = pako.deflate(JSON.stringify(manifestData));
+            const blob = new Blob([compressed], { type: 'application/octet-stream' });
+            const fileObj = new File([blob], 'dir_manifest.bin');
+            
+            const msgIds = await fileManager.discordFileStorage.upload(fileObj, "manifest");
+            const manifestUrls = await fileManager.getAttachmentUrls(msgIds);
+            
+            const url = `${window.location.origin}${window.location.pathname}#/share?manifest=${encodeURIComponent(manifestUrls[0])}`;
+            await navigator.clipboard.writeText(url);
+            toast.success("Lien de partage du dossier copié !", { id: tId });
+            
+         } else {
+            const urls = await fileManager.getAttachmentUrls(f.path!);
+            const encoded = btoa(String.fromCharCode.apply(null, Array.from(pako.deflate(JSON.stringify(urls)))))
+               .replace(/\+/g, '~').replace(/\//g, '_').replace(/=/g, '-');
+            
+            const url = `${window.location.origin}${window.location.pathname}#/share?name=${encodeURIComponent(f.name)}&size=${f.size}&data=${encoded}`;
+            await navigator.clipboard.writeText(url);
+            toast.success("Lien de partage copié dans le presse-papier", { id: tId });
+         }
       } catch(e: any) {
-         toast.error("Échec du partage");
+         toast.error(`Échec du partage: ${e.message}`, { id: tId });
       }
     },
     download: async (f?: DisboxFile) => {
@@ -318,18 +364,9 @@ export function FileTable() {
               ><DownloadCloud className="w-4 h-4"/> <span className="hidden sm:inline">Télécharger</span></button>
 
               <button 
-                onClick={async () => {
-                  if (!fileManager || !confirm(`Supprimer ${selectedFiles.length} élément(s) ?`)) return;
-                  const tId = toast.loading("Suppression globale...");
-                  try {
-                    for (const sf of selectedFiles) {
-                      if (sf.type === 'directory') await fileManager.deleteDirectoryRecursive(sf.path!);
-                      else await fileManager.deleteFile(sf.path!);
-                    }
-                    toast.success("Tout supprimé !", { id: tId });
-                    refreshFiles();
-                    setRowSelection({});
-                  } catch (err: any) { toast.error(err.message, { id: tId }); }
+                onClick={() => {
+                  if (!fileManager) return;
+                  setBulkDeleteConfirm(true);
                 }}
                 className="px-3 py-1.5 rounded-lg hover:bg-red-500/10 text-red-400 text-sm font-medium flex items-center gap-2 transition-colors"
                 title="Supprimer"
@@ -378,6 +415,27 @@ export function FileTable() {
             } catch(e: any) { 
               toast.error(`Erreur: ${e.message}`, { id: tId }); 
             }
+          }} 
+        />
+      )}
+
+      {bulkDeleteConfirm && (
+        <ConfirmDialog 
+          title="Supprimer les éléments"
+          message={`Supprimer ${selectedFiles.length} élément(s) définitivement ?`}
+          onClose={() => setBulkDeleteConfirm(false)} 
+          onConfirm={async () => {
+            if (!fileManager) return;
+            const tId = toast.loading("Suppression globale...");
+            try {
+              for (const sf of selectedFiles) {
+                if (sf.type === 'directory') await fileManager.deleteDirectoryRecursive(sf.path!);
+                else await fileManager.deleteFile(sf.path!);
+              }
+              toast.success("Tout supprimé !", { id: tId });
+              refreshFiles();
+              setRowSelection({});
+            } catch (err: any) { toast.error(err.message, { id: tId }); }
           }} 
         />
       )}
