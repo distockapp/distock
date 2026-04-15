@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Distock — Discord CDN Accelerator",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "description": "Accelerates file downloads and bypasses CORS restrictions for ultra-fast Discord Webhook uploads.",
 
   "icons": {
@@ -31,7 +31,9 @@
 
   "host_permissions": [
     "*://*.discordapp.com/*",
-    "*://*.discord.com/*"
+    "*://*.discord.com/*",
+    "*://distockapp.github.io/*",
+    "*://localhost/*"
   ],
 
   "declarative_net_request": {
