@@ -237,35 +237,30 @@ class DiscordWebhookClient {
 }
 
 // ─── Discord File Storage ───────────────────────────────────────────────
-// Multi-webhook support: distributes chunks across webhooks in round-robin.
+// Single webhook support.
 
 class DiscordFileStorage {
-  private webhookClients: DiscordWebhookClient[];
+  private webhookClient: DiscordWebhookClient;
 
-  constructor(webhookUrls: string[]) {
-    this.webhookClients = webhookUrls.map(url => new DiscordWebhookClient(url));
-    console.log(`[Distock] Storage initialized with ${this.webhookClients.length} webhook(s)`);
+  constructor(webhookUrl: string) {
+    this.webhookClient = new DiscordWebhookClient(webhookUrl);
+    console.log(`[Distock] Storage initialized with single webhook`);
+  }
+
+  get userId() {
+    return this.webhookClient.label;
   }
 
   async getAttachmentUrls(messageIds: string[]): Promise<string[]> {
     const urls: string[] = [];
     for (const id of messageIds) {
-      // Try each webhook since we don't know which one holds the message
-      let found = false;
-      for (const client of this.webhookClients) {
-        try {
-          const msg = await client.getMessage(id);
-          if (msg?.attachments?.[0]?.url) {
-            urls.push(msg.attachments[0].url);
-            found = true;
-            break;
-          }
-        } catch {
-          // Try next client
+      try {
+        const msg = await this.webhookClient.getMessage(id);
+        if (msg?.attachments?.[0]?.url) {
+          urls.push(msg.attachments[0].url);
         }
-      }
-      if (!found) {
-        console.warn(`[Distock] Message ${id} not found across ${this.webhookClients.length} webhooks`);
+      } catch (err) {
+        console.warn(`[Distock] Message ${id} not found:`, err);
       }
     }
     return urls;
@@ -287,16 +282,12 @@ class DiscordFileStorage {
     const totalChunks = Math.ceil(sourceFile.size / CHUNK_SIZE);
 
     console.log(`[Distock] Upload: ${sourceFile.name} (${(sourceFile.size / 1024 / 1024).toFixed(1)} MB)`);
-    console.log(`[Distock] ${totalChunks} chunks of ${(CHUNK_SIZE / 1024 / 1024).toFixed(1)} MB across ${this.webhookClients.length} webhook(s)`);
+    console.log(`[Distock] ${totalChunks} chunks of ${(CHUNK_SIZE / 1024 / 1024).toFixed(1)} MB`);
 
     if (onProgress) onProgress(0, sourceFile.size);
 
     for await (const chunk of readFile(sourceFile, CHUNK_SIZE)) {
-      // Round-robin: distribute chunks across webhooks
-      const clientIndex = index % this.webhookClients.length;
-      const client = this.webhookClients[clientIndex];
       const chunkLabel = `${namePrefix}_${index}`;
-
       let attempts = 0;
       const maxAttempts = 5;
       let result: any = null;
@@ -305,17 +296,17 @@ class DiscordFileStorage {
         attempts++;
         try {
           const startTime = Date.now();
-          console.log(`[Distock][${client.label}] Chunk ${index}/${totalChunks - 1} (Attempt ${attempts})...`);
+          console.log(`[Distock][SingleHook] Chunk ${index}/${totalChunks - 1} (Attempt ${attempts})...`);
 
-          result = await client.sendAttachment(chunkLabel, new Blob([chunk]));
+          result = await this.webhookClient.sendAttachment(chunkLabel, new Blob([chunk]));
 
           const elapsed = (Date.now() - startTime) / 1000;
           const speed = (chunk.byteLength / 1024 / 1024) / Math.max(elapsed, 0.1);
-          console.log(`[Distock][${client.label}] ✓ Chunk ${index} done in ${elapsed.toFixed(1)}s (${speed.toFixed(1)} MB/s)`);
+          console.log(`[Distock][SingleHook] ✓ Chunk ${index} done in ${elapsed.toFixed(1)}s (${speed.toFixed(1)} MB/s)`);
           
           break; // Success, exit retry loop
         } catch (error: any) {
-          console.warn(`[Distock][${client.label}] Chunk ${index} failed (attempt ${attempts}/${maxAttempts}):`, error.message);
+          console.warn(`[Distock][SingleHook] Chunk ${index} failed (attempt ${attempts}/${maxAttempts}):`, error.message);
           if (attempts >= maxAttempts) {
              throw new Error(`Failed to upload chunk ${index} after ${maxAttempts} attempts: ${error.message}`);
           }
@@ -349,14 +340,10 @@ class DiscordFileStorage {
     let deleted = 0;
     if (onProgress) onProgress(0, messageIds.length);
     for (const id of messageIds) {
-      // Try all clients since we don't know which one owns the message
-      for (const client of this.webhookClients) {
-        try {
-          await client.deleteMessage(id);
-          break;
-        } catch {
-          // Continue to next client
-        }
+      try {
+        await this.webhookClient.deleteMessage(id);
+      } catch (err) {
+        console.warn(`[Distock] Failed to delete message ${id}:`, err);
       }
       deleted++;
       if (onProgress) onProgress(deleted, messageIds.length);
@@ -409,7 +396,7 @@ export class DisboxFileManager {
     console.log(`[Distock] Connected. File tree loaded.`);
     return new DisboxFileManager(
       sha256(chosenUrl),
-      new DiscordFileStorage(urls),
+      new DiscordFileStorage(urls[0]), // Temporarily force single webhook usage
       fileTree as DisboxTree
     );
   }
