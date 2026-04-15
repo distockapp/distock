@@ -1,45 +1,52 @@
 // Distock Extension — Content Script
-// Bridge between the Distock page and the extension's background.js
-// Handles ONLY download proxying — uploads go direct to Discord
+// CSP-compliant Dataset approach
 
 (function() {
-  // Inject extension detection flag safely (CSP-compliant)
   document.documentElement.dataset.distockExtension = 'true';
 
-  // Listen for download proxy requests from the page
   window.addEventListener('message', (event) => {
-    if (event.source !== window) return;
-    if (!event.data || event.data.source !== 'DISTOCK_PAGE') return;
+    if (event.source !== window || !event.data || event.data.source !== 'DISTOCK_PAGE') return;
 
     if (event.data.type === 'PING') {
-      chrome.runtime.sendMessage({ type: 'DISTOCK_PING' }, (response) => {
-        window.postMessage({
-          source: 'DISTOCK_EXTENSION',
-          type: 'PONG',
-          version: response?.version
-        }, '*');
-      });
+      try {
+        chrome.runtime.sendMessage({ type: 'DISTOCK_PING' }, (response) => {
+          window.postMessage({
+            source: 'DISTOCK_EXTENSION', type: 'PONG', version: response?.version
+          }, '*');
+        });
+      } catch (e) {
+        // Extension context invalidated
+      }
       return;
     }
 
-    // Download proxy: page asks us to fetch a URL (bypasses CORS on CDN)
     if (event.data.type === 'FETCH_URL') {
-      const { requestId, url } = event.data;
+      try {
+        chrome.runtime.sendMessage({ type: 'DISTOCK_FETCH_URL', url: event.data.url }, (r) => {
+          window.postMessage({ source: 'DISTOCK_EXTENSION', type: 'FETCH_RESULT', requestId: event.data.requestId, data: r?.data || null }, '*');
+        });
+      } catch (e) {
+        window.postMessage({ source: 'DISTOCK_EXTENSION', type: 'FETCH_RESULT', requestId: event.data.requestId, data: null }, '*');
+      }
+      return;
+    }
 
-      chrome.runtime.sendMessage({
-        type: 'DISTOCK_FETCH_URL',
-        url: url
-      }, (response) => {
-        window.postMessage({
-          source: 'DISTOCK_EXTENSION',
-          type: 'FETCH_RESULT',
-          requestId: requestId,
-          data: response?.data || null
-        }, '*');
-      });
+    if (event.data.type === 'UPLOAD_CHUNK') {
+      try {
+        chrome.runtime.sendMessage({
+          type: 'DISTOCK_UPLOAD_CHUNK',
+          url: event.data.url,
+          filename: event.data.filename,
+          base64: event.data.base64
+        }, (r) => {
+          window.postMessage({ source: 'DISTOCK_EXTENSION', requestId: event.data.requestId, ...r }, '*');
+        });
+      } catch (e) {
+        window.postMessage({ source: 'DISTOCK_EXTENSION', requestId: event.data.requestId, error: e.message }, '*');
+      }
       return;
     }
   });
 
-  console.log('[Distock Extension] Content script loaded — download proxy ready.');
+  console.log('[Distock Extension] Content script loaded.');
 })();

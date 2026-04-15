@@ -209,6 +209,43 @@ class DiscordWebhookClient {
   }
 
   async sendAttachment(filename: string, blob: Blob): Promise<{ id: string }> {
+    // We must use the background.js proxy to bypass uBlock Origin / Brave Shields.
+    // Direct `fetch()` to discord.com/api/webhooks is blocked by ERR_BLOCKED_BY_CLIENT globally!
+    // We convert the file to a base64 string because Chrome IPC limits cause V8 engine crashes on ArrayBuffers.
+    
+    if (typeof document !== 'undefined' && document.documentElement.dataset.distockExtension) {
+      // Convert Blob to Base64
+      const base64Data: string = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result as string);
+        reader.onerror = reject;
+        reader.readAsDataURL(blob);
+      });
+
+      const response: any = await new Promise((resolve) => {
+        const reqId = `up_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+        const handler = (event: MessageEvent) => {
+          if (event.source !== window || event.data?.requestId !== reqId) return;
+          window.removeEventListener('message', handler);
+          resolve(event.data);
+        };
+        window.addEventListener('message', handler);
+        window.postMessage({
+          source: 'DISTOCK_PAGE',
+          type: 'UPLOAD_CHUNK',
+          requestId: reqId,
+          url: `${this.baseUrl}?wait=true`,
+          filename,
+          base64: base64Data
+        }, '*');
+      });
+
+      if (response.error) throw new Error(response.error);
+      if (response.status >= 400) throw new Error(`Status ${response.status}`);
+      return response.data;
+    }
+
+    // Fallback if extension is somehow missing, though it will likely fail with ERR_BLOCKED_BY_CLIENT
     const formData = new FormData();
     formData.append('payload_json', JSON.stringify({}));
     formData.append('file', blob, filename);
