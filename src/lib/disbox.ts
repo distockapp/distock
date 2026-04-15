@@ -179,8 +179,9 @@ class DiscordWebhookClient {
 
   async fetchFromApi(
     path: string,
-    { type, method, body }: { type: string; method: string; body?: BodyInit }
+    { type, method, body, retries = 0 }: { type: string; method: string; body?: BodyInit, retries?: number }
   ): Promise<Response> {
+    if (retries > 3) throw new Error('[Distock] Max retries exceeded due to persistent rate limit or network block.');
     // Wait if we're rate limited for this operation type
     if (this.rateLimitWaits[type] > 0) {
       console.log(`[Distock][${this.label}] Rate limit: waiting ${this.rateLimitWaits[type]}ms (${type})`);
@@ -191,7 +192,7 @@ class DiscordWebhookClient {
     try {
       response = await fetch(`${this.baseUrl}${path}`, { method, body });
     } catch (err: any) {
-      if ((err.name === 'TypeError' || err.message.includes('Failed to fetch')) && method === 'GET') {
+      if (err.name === 'TypeError' || err.message.includes('Failed to fetch')) {
          console.warn(`[Distock][${this.label}] CORS/Network blinddrop! Evading via secure proxy...`);
          const targetUrl = `${this.baseUrl}${path}`;
          try {
@@ -201,14 +202,8 @@ class DiscordWebhookClient {
             console.warn(`[Distock][${this.label}] Proxy also failed. Backing off for ${backoffTime/1000}s`);
             this.rateLimitWaits[type] = backoffTime;
             await sleep(backoffTime);
-            return await this.fetchFromApi(path, { type, method, body });
+            return await this.fetchFromApi(path, { type, method, body, retries: retries + 1 });
          }
-      } else if (err.name === 'TypeError' || err.message.includes('Failed to fetch')) {
-         const backoffTime = 5000;
-         console.warn(`[Distock][${this.label}] Network/CORS crash! (Likely 429 Rate Limit). Backing off for ${backoffTime/1000}s`);
-         this.rateLimitWaits[type] = backoffTime;
-         await sleep(backoffTime);
-         return await this.fetchFromApi(path, { type, method, body });
       } else {
          throw err;
       }
@@ -230,7 +225,7 @@ class DiscordWebhookClient {
       }
       this.rateLimitWaits[type] = retryAfter * 1000;
       console.warn(`[Distock][${this.label}] 429 rate limited — retrying after ${retryAfter}s`);
-      return await this.fetchFromApi(path, { type, method, body });
+      return await this.fetchFromApi(path, { type, method, body, retries: retries + 1 });
     }
 
     if (response.status >= 400) {
