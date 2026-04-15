@@ -443,7 +443,6 @@ export class DisboxFileManager {
 
     // The first webhook is the "master" — it determines the file tree.
     const webhookUrl = urls[0];
-    const url = new URL(webhookUrl);
     const fileTrees: Record<string, any> = {};
 
     // Execute requests in parallel to drastically reduce cold start server delays
