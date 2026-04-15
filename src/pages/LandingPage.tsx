@@ -5,14 +5,14 @@ import { Shield, Zap, Cloud, Info, X } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 
 export function LandingPage() {
-  const [webhook, setWebhook] = useState('');
+  const [webhooks, setWebhooks] = useState<string[]>(['']);
   const [showMultiHookTutorial, setShowMultiHookTutorial] = useState(false);
   const setWebhookUrl = useDriveStore(s => s.setWebhookUrl);
   const navigate = useNavigate();
 
   const handleSetup = (e: FormEvent) => {
     e.preventDefault();
-    const rawUrls = webhook.split(/[\n, ]+/).map(s => s.trim()).filter(Boolean);
+    const rawUrls = webhooks.map(s => s.trim()).filter(Boolean);
     if (rawUrls.length === 0) {
        alert("Veuillez entrer au moins une URL.");
        return;
@@ -25,6 +25,18 @@ export function LandingPage() {
     }
     setWebhookUrl(rawUrls.join(','));
     navigate('/drive');
+  };
+
+  const addWebhookField = () => setWebhooks([...webhooks, '']);
+  const removeWebhookField = (index: number) => {
+    const newHooks = [...webhooks];
+    newHooks.splice(index, 1);
+    setWebhooks(newHooks);
+  };
+  const updateWebhook = (index: number, value: string) => {
+    const newHooks = [...webhooks];
+    newHooks[index] = value;
+    setWebhooks(newHooks);
   };
 
   return (
@@ -42,7 +54,7 @@ export function LandingPage() {
         </h1>
         <p className="text-xl text-textSecondary mb-12 max-w-2xl">
           Contournez les limites. Gratuit, rapide, sécurisé.
-          Entrez un Webhook URL Discord pour commencer.
+          Entrez un ou plusieurs Webhook URLs Discord pour commencer.
         </p>
 
         <form onSubmit={handleSetup} className="w-full max-w-xl bg-surface/80 p-8 rounded-2xl shadow-xl border border-white/10 backdrop-blur relative z-10">
@@ -62,16 +74,37 @@ export function LandingPage() {
               <li>Créez un serveur Discord privé.</li>
               <li>Allez dans Paramètres du Serveur {">"} Intégrations {">"} Webhooks.</li>
               <li>Cliquez sur Créer, puis Copier l'URL du Webhook.</li>
-              <li>Collez l'URL ci-dessous. Par mesure de sécurité, elle est chiffrée localement : personne d'autre n'y aura jamais accès.</li>
+              <li>Collez l'URL ci-dessous. Ajoutez-en d'autres pour multiplier la vitesse.</li>
             </ol>
           </div>
-            <textarea
-              value={webhook}
-              onChange={(e) => setWebhook(e.target.value)}
-              placeholder="https://discord.com/api/webhooks/...\nhttps://discord.com/api/webhooks/..."
-              className="w-full h-32 bg-background border border-white/10 rounded-lg px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-discord transition-all mb-4 resize-y"
-            />
-          <button type="submit" disabled={!webhook} className="w-full bg-discord hover:bg-discord/80 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold py-3 rounded-lg transition-colors">
+          
+          <div className="space-y-3 mb-6">
+            {webhooks.map((hook, idx) => (
+               <div key={idx} className="flex items-center gap-2">
+                 <div className="bg-background border border-white/10 rounded-lg flex-1 flex items-center px-4 focus-within:ring-2 focus-within:ring-discord transition-all">
+                   <span className="text-white/30 text-sm font-mono mr-2">{idx === 0 ? 'Maître' : `Hook ${idx+1}`}</span>
+                   <input
+                     type="text"
+                     placeholder="https://discord.com/api/webhooks/..."
+                     value={hook}
+                     onChange={(e) => updateWebhook(idx, e.target.value)}
+                     className="w-full bg-transparent py-3 text-white focus:outline-none text-sm placeholder:text-white/20"
+                   />
+                 </div>
+                 {webhooks.length > 1 && (
+                   <button type="button" onClick={() => removeWebhookField(idx)} className="p-3 bg-red-500/10 hover:bg-red-500/20 text-red-400 rounded-lg transition-colors">
+                     <X className="w-5 h-5"/>
+                   </button>
+                 )}
+               </div>
+            ))}
+            
+            <button type="button" onClick={addWebhookField} className="w-full border border-dashed border-white/20 hover:border-discord hover:text-discord text-white/50 text-sm font-medium py-3 rounded-lg transition-all">
+              + Ajouter un Webhook (Multiplie la Vitesse)
+            </button>
+          </div>
+
+          <button type="submit" disabled={!webhooks.some(h => h.trim())} className="w-full bg-discord hover:bg-discord/80 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold py-3 rounded-lg transition-colors">
             Accéder au Drive
           </button>
         </form>
