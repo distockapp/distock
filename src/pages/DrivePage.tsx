@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import { useDriveStore } from '../store/useDriveStore';
 import { FileTable } from '../components/FileTable';
 import { Search, Upload, FolderPlus, LogOut, ArrowLeft, RefreshCw, ServerCrash, Cloud } from 'lucide-react';
@@ -12,6 +12,7 @@ export function DrivePage() {
   const [progress, setProgress] = useState(0);
   const [uploadSpeed, setUploadSpeed] = useState('');
   const [uploadETA, setUploadETA] = useState('');
+  const activeUploadRef = useRef(false);
 
   const [showNewFolderDialog, setShowNewFolderDialog] = useState(false);
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
@@ -19,7 +20,12 @@ export function DrivePage() {
 
   const onDrop = useCallback(async (acceptedFiles: File[]) => {
     if (!fileManager) return;
+    if (activeUploadRef.current) {
+      toast.error('Veuillez patienter la fin de l’envoi actuel avant d’en ajouter de nouveaux.');
+      return;
+    }
     
+    activeUploadRef.current = true;
     setIsUploading(true);
     setProgress(0);
     setUploadSpeed('');
@@ -85,6 +91,7 @@ export function DrivePage() {
     }
     
     refreshFiles();
+    activeUploadRef.current = false;
     setIsUploading(false);
     setProgress(0);
     setUploadSpeed('');
