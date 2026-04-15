@@ -24,6 +24,22 @@ async function sleep(ms: number) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+async function apiFetch(url: string, init?: RequestInit, attempts = 3): Promise<Response> {
+  // Robust fetch for our fly.dev metadata server that might sleep or drop connections
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const res = await fetch(url, init);
+      if (res.status >= 500) throw new Error(`Server Error ${res.status}`);
+      return res;
+    } catch (e: any) {
+      if (i === attempts) throw e;
+      console.warn(`[Distock] API Fetch failed (attempt ${i}/${attempts}), retrying in 2s...`, e.message);
+      await sleep(2000);
+    }
+  }
+  throw new Error("API Fetch failed completely");
+}
+
 async function* readFile(file: File, chunkSize: number) {
   let offset = 0;
   while (offset < file.size) {
@@ -148,8 +164,8 @@ class DiscordWebhookClient {
     // Parse webhook URL to extract ID and token
     const id = webhookUrl.split('/').slice(0, -1).pop();
     const token = webhookUrl.split('/').pop();
-    // Use discordapp.com — identical to the original Disbox (proven to work)
-    this.baseUrl = `https://discordapp.com/api/webhooks/${id}/${token}`;
+    // Use discord.com — discordapp.com is deprecated and causes CORS redirect failures on POST requests
+    this.baseUrl = `https://discord.com/api/webhooks/${id}/${token}`;
     this.label = `WH-${id?.slice(-4) || '????'}`;
   }
 
@@ -273,22 +289,38 @@ class DiscordFileStorage {
       // Round-robin: distribute chunks across webhooks
       const clientIndex = index % this.webhookClients.length;
       const client = this.webhookClients[clientIndex];
+      const chunkLabel = `${namePrefix}_${index}`;
 
-      const startTime = Date.now();
-      console.log(`[Distock][${client.label}] Chunk ${index}/${totalChunks - 1} (${(chunk.byteLength / 1024 / 1024).toFixed(1)} MB)...`);
+      let attempts = 0;
+      const maxAttempts = 5;
+      let result: any = null;
 
-      const result = await client.sendAttachment(
-        `${namePrefix}_${index}`,
-        new Blob([chunk])
-      );
+      while (attempts < maxAttempts) {
+        attempts++;
+        try {
+          const startTime = Date.now();
+          console.log(`[Distock][${client.label}] Chunk ${index}/${totalChunks - 1} (Attempt ${attempts})...`);
+
+          result = await client.sendAttachment(chunkLabel, new Blob([chunk]));
+
+          const elapsed = (Date.now() - startTime) / 1000;
+          const speed = (chunk.byteLength / 1024 / 1024) / Math.max(elapsed, 0.1);
+          console.log(`[Distock][${client.label}] ✓ Chunk ${index} done in ${elapsed.toFixed(1)}s (${speed.toFixed(1)} MB/s)`);
+          
+          break; // Success, exit retry loop
+        } catch (error: any) {
+          console.warn(`[Distock][${client.label}] Chunk ${index} failed (attempt ${attempts}/${maxAttempts}):`, error.message);
+          if (attempts >= maxAttempts) {
+             throw new Error(`Failed to upload chunk ${index} after ${maxAttempts} attempts: ${error.message}`);
+          }
+          // Exponential backoff
+          await sleep(Math.pow(2, attempts) * 1000 + (Math.random() * 1000));
+        }
+      }
 
       messageIds.push(result.id);
       uploadedBytes += chunk.byteLength;
       index++;
-
-      const elapsed = (Date.now() - startTime) / 1000;
-      const speed = (chunk.byteLength / 1024 / 1024) / elapsed;
-      console.log(`[Distock][${client.label}] ✓ Chunk ${index - 1} done in ${elapsed.toFixed(1)}s (${speed.toFixed(1)} MB/s)`);
 
       if (onProgress) onProgress(uploadedBytes, sourceFile.size);
     }
@@ -442,7 +474,7 @@ export class DisboxFileManager {
       changes.updated_at = new Date().toISOString();
     }
 
-    const result = await fetch(`${SERVER_URL}/files/update/${this.userId}/${file.id}`, {
+    const result = await apiFetch(`${SERVER_URL}/files/update/${this.userId}/${file.id}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(changes),
@@ -508,7 +540,7 @@ export class DisboxFileManager {
       updated_at: new Date().toISOString(),
     };
 
-    const result = await fetch(`${SERVER_URL}/files/create/${this.userId}`, {
+    const result = await apiFetch(`${SERVER_URL}/files/create/${this.userId}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(newFile),
@@ -570,7 +602,7 @@ export class DisboxFileManager {
       }
     }
 
-    const result = await fetch(`${SERVER_URL}/files/delete/${this.userId}/${file.id}`, {
+    const result = await apiFetch(`${SERVER_URL}/files/delete/${this.userId}/${file.id}`, {
       method: 'DELETE',
     });
     if (result.status !== 200) {
