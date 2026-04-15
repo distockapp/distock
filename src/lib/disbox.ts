@@ -325,64 +325,78 @@ class DiscordFileStorage {
     namePrefix: string,
     onProgress: ProgressCallback | null = null
   ): Promise<string[]> {
-    const messageIds: string[] = [];
+    const messageIdMap: string[] = new Array(totalChunks).fill("");
     let uploadedBytes = 0;
     let index = 0;
-    const totalChunks = Math.ceil(sourceFile.size / CHUNK_SIZE);
 
     console.log(`[Distock] Upload: ${sourceFile.name} (${(sourceFile.size / 1024 / 1024).toFixed(1)} MB)`);
     console.log(`[Distock] ${totalChunks} chunks of ${(CHUNK_SIZE / 1024 / 1024).toFixed(1)} MB across ${this.webhookClients.length} hook(s)`);
 
     if (onProgress) onProgress(0, sourceFile.size);
 
+    const processBatch = async (batch: any[]) => {
+      await Promise.all(batch.map(async (item) => {
+        let attempts = 0;
+        const maxAttempts = 5;
+        let result: any = null;
+
+        while (attempts < maxAttempts) {
+          attempts++;
+          try {
+            const startTime = Date.now();
+            console.log(`[Distock][${item.client.label}] Chunk ${item.index}/${totalChunks - 1} (Attempt ${attempts})...`);
+
+            result = await item.client.sendAttachment(item.chunkLabel, new Blob([item.chunk]));
+            
+            if (!result || !result.id) {
+               throw new Error(`Discord API returned invalid response (No ID): ${JSON.stringify(result)}`);
+            }
+
+            const elapsed = (Date.now() - startTime) / 1000;
+            const speed = (item.chunk.byteLength / 1024 / 1024) / Math.max(elapsed, 0.1);
+            console.log(`[Distock][${item.client.label}] ✓ Chunk ${item.index} done in ${elapsed.toFixed(1)}s (${speed.toFixed(1)} MB/s)`);
+            
+            break; // Success, exit retry loop
+          } catch (error: any) {
+            console.warn(`[Distock][${item.client.label}] Chunk ${item.index} failed (attempt ${attempts}/${maxAttempts}):`, error.message);
+            if (attempts >= maxAttempts) {
+               throw new Error(`Failed to upload chunk ${item.index} after ${maxAttempts} attempts: ${error.message}`);
+            }
+            // Exponential backoff
+            await sleep(Math.pow(2, attempts) * 1000 + (Math.random() * 1000));
+          }
+        }
+
+        if (!result || !result.id) {
+          throw new Error(`Result is irrevocably undefined after loop!`);
+        }
+        messageIdMap[item.index] = result.id;
+        uploadedBytes += item.chunk.byteLength;
+        if (onProgress) onProgress(uploadedBytes, sourceFile.size);
+      }));
+    };
+
+    let currentBatch: any[] = [];
     for await (const chunk of readFile(sourceFile, CHUNK_SIZE)) {
       const clientIndex = index % this.webhookClients.length;
       const client = this.webhookClients[clientIndex];
       const chunkLabel = `${namePrefix}_${index}`;
       
-      let attempts = 0;
-      const maxAttempts = 5;
-      let result: any = null;
-
-      while (attempts < maxAttempts) {
-        attempts++;
-        try {
-          const startTime = Date.now();
-          console.log(`[Distock][${client.label}] Chunk ${index}/${totalChunks - 1} (Attempt ${attempts})...`);
-
-          result = await client.sendAttachment(chunkLabel, new Blob([chunk]));
-          
-          if (!result || !result.id) {
-             throw new Error(`Discord API returned invalid response (No ID): ${JSON.stringify(result)}`);
-          }
-
-          const elapsed = (Date.now() - startTime) / 1000;
-          const speed = (chunk.byteLength / 1024 / 1024) / Math.max(elapsed, 0.1);
-          console.log(`[Distock][${client.label}] ✓ Chunk ${index} done in ${elapsed.toFixed(1)}s (${speed.toFixed(1)} MB/s)`);
-          
-          break; // Success, exit retry loop
-        } catch (error: any) {
-          console.warn(`[Distock][${client.label}] Chunk ${index} failed (attempt ${attempts}/${maxAttempts}):`, error.message);
-          if (attempts >= maxAttempts) {
-             throw new Error(`Failed to upload chunk ${index} after ${maxAttempts} attempts: ${error.message}`);
-          }
-          // Exponential backoff
-          await sleep(Math.pow(2, attempts) * 1000 + (Math.random() * 1000));
-        }
+      currentBatch.push({ chunk, index, client, chunkLabel });
+      
+      if (currentBatch.length >= this.webhookClients.length) {
+        await processBatch(currentBatch);
+        currentBatch = [];
       }
-
-      if (!result || !result.id) {
-        throw new Error(`Result is irrevocably undefined after loop!`);
-      }
-      messageIds.push(result.id);
-      uploadedBytes += chunk.byteLength;
       index++;
-
-      if (onProgress) onProgress(uploadedBytes, sourceFile.size);
     }
 
-    console.log(`[Distock] ✓ Upload complete: ${messageIds.length} chunks`);
-    return messageIds;
+    if (currentBatch.length > 0) {
+      await processBatch(currentBatch);
+    }
+
+    console.log(`[Distock] ✓ Upload complete: ${messageIdMap.length} chunks`);
+    return messageIdMap;
   }
 
   async download(
