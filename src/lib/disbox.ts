@@ -436,7 +436,7 @@ export class DisboxFileManager {
   fileTree: DisboxTree;
 
   static async create(webhookUrlRaw: string): Promise<DisboxFileManager> {
-    const urls = webhookUrlRaw.split(',').map(s => s.trim()).filter(Boolean);
+    const urls = webhookUrlRaw.split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
     if (urls.length === 0) throw new Error('No webhook URL provided');
 
     console.log(`[Distock] Connecting with ${urls.length} webhook(s)...`);
