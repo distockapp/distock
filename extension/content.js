@@ -1,9 +1,8 @@
 // Content Script — injecté dans les pages Distock
-// Signale à l'application web que l'extension est bien installée et active
+// Pont entre la page web et le service worker de l'extension
 
 (function() {
-  // Inject a script tag into the page's main world so the flag is accessible
-  // by the page's JavaScript (content scripts run in isolated world)
+  // Inject flag into the page's main world (content scripts are isolated)
   const script = document.createElement('script');
   script.textContent = `
     window.__DISTOCK_EXTENSION__ = true;
@@ -12,11 +11,15 @@
   (document.head || document.documentElement).appendChild(script);
   script.remove();
 
-  // Écoute les messages de la page web
+  // ─── Upload Proxy Relay ──────────────────────────────────────────────
+  // Relaye les requêtes d'upload de la page vers le background.js
+  // et renvoie les réponses à la page.
+
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
     if (!event.data || event.data.source !== 'DISTOCK_PAGE') return;
 
+    // Handle PING
     if (event.data.type === 'PING') {
       chrome.runtime.sendMessage({ type: 'DISTOCK_PING' }, (response) => {
         window.postMessage({
@@ -25,6 +28,28 @@
           version: response?.version
         }, '*');
       });
+      return;
+    }
+
+    // Handle UPLOAD_CHUNK — relay binary data to background.js
+    if (event.data.type === 'UPLOAD_CHUNK') {
+      const { requestId, webhookUrl, chunkData, chunkName } = event.data;
+      
+      chrome.runtime.sendMessage({
+        type: 'DISTOCK_UPLOAD_CHUNK',
+        webhookUrl,
+        chunkData,  // ArrayBuffer — supported via structured cloning (Chrome 133+)
+        chunkName
+      }, (response) => {
+        // Relay the response back to the page
+        window.postMessage({
+          source: 'DISTOCK_EXTENSION',
+          type: 'UPLOAD_RESULT',
+          requestId,
+          ...response
+        }, '*');
+      });
+      return;
     }
   });
 
@@ -33,5 +58,5 @@
     detail: { version: chrome.runtime.getManifest().version }
   }));
 
-  console.log(`[Distock Extension v${chrome.runtime.getManifest().version}] Actif — Mode Proxy Direct CDN activé.`);
+  console.log(`[Distock Extension v${chrome.runtime.getManifest().version}] Actif — Proxy Upload Discord activé.`);
 })();

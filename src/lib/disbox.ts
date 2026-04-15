@@ -8,6 +8,69 @@ import { CHUNK_SIZE, UPLOAD_TIMEOUT_MS, API_TIMEOUT_MS } from './constants';
 const SERVER_URL = 'https://disbox-server.fly.dev';
 export const FILE_DELIMITER = '/';
 
+// ─── Extension Proxy Upload ─────────────────────────────────────────────
+// Sends chunks through the Chrome extension's background.js (no CORS)
+
+function hasExtensionProxy(): boolean {
+  return typeof window !== 'undefined' && (window as any).__DISTOCK_EXTENSION__ === true;
+}
+
+let _extensionProxyMessageId = 0;
+
+/**
+ * Upload a chunk via the Chrome extension's background.js service worker.
+ * This bypasses all CORS restrictions since the extension has full network access.
+ * Returns the Discord message data { id, ... } or throws on failure.
+ */
+async function uploadChunkViaExtension(
+  webhookUrl: string, 
+  chunkBlob: Blob, 
+  chunkName: string
+): Promise<{ id: string }> {
+  const arrayBuffer = await chunkBlob.arrayBuffer();
+  const requestId = `req_${++_extensionProxyMessageId}_${Date.now()}`;
+
+  return new Promise((resolve, reject) => {
+    const timeoutId = setTimeout(() => {
+      window.removeEventListener('message', handler);
+      reject(new Error('Extension proxy timeout (3min)'));
+    }, UPLOAD_TIMEOUT_MS);
+
+    const handler = (event: MessageEvent) => {
+      if (event.source !== window) return;
+      if (event.data?.source !== 'DISTOCK_EXTENSION') return;
+      if (event.data?.type !== 'UPLOAD_RESULT') return;
+      if (event.data?.requestId !== requestId) return;
+
+      clearTimeout(timeoutId);
+      window.removeEventListener('message', handler);
+
+      if (event.data.error) {
+        reject(new Error(event.data.error));
+      } else if (event.data.rateLimited) {
+        // Rate limited — caller should retry after delay
+        reject(new Error(`RATE_LIMITED:${event.data.retryAfter || 2}`));
+      } else if (event.data.data) {
+        resolve(event.data.data);
+      } else {
+        reject(new Error('Extension proxy: no response data'));
+      }
+    };
+
+    window.addEventListener('message', handler);
+
+    // Send chunk data to content script → background.js
+    window.postMessage({
+      source: 'DISTOCK_PAGE',
+      type: 'UPLOAD_CHUNK',
+      requestId,
+      webhookUrl,
+      chunkData: arrayBuffer,
+      chunkName
+    }, '*');
+  });
+}
+
 /**
  * Fetch wrapper with timeout and automatic CORS proxy fallback for the metadata server.
  */
@@ -59,7 +122,7 @@ async function apiFetch(url: string, init?: RequestInit): Promise<Response> {
 export type ProgressCallback = (value: number, total: number) => void;
 
 class DiscordWebhookClient {
-  private baseUrl: string;
+  private _baseUrl: string;
   private queue: Array<() => Promise<void>> = [];
   private isProcessingQueue = false;
   private lastRequests: number[] = [];
@@ -70,8 +133,12 @@ class DiscordWebhookClient {
     const token = parts.pop();
     const id = parts.pop();
     // Use discord.com (modern endpoint) — discordapp.com may redirect causing POST→GET conversion
-    this.baseUrl = `https://discord.com/api/webhooks/${id}/${token}`;
+    this._baseUrl = `https://discord.com/api/webhooks/${id}/${token}`;
     this.label = `WH-${id?.slice(-4) || '????'}`;
+  }
+
+  get webhookUrl(): string {
+    return this._baseUrl;
   }
 
   // File d'attente pour éviter le rate limiting strict (5 req / 2s)
@@ -116,7 +183,7 @@ class DiscordWebhookClient {
   }
 
   private async _doFetch(path: string, options: RequestInit, retries = 3): Promise<Response> {
-    const url = `${this.baseUrl}${path}`;
+    const url = `${this._baseUrl}${path}`;
     let response: Response;
     
     try {
@@ -340,27 +407,49 @@ class DiscordFileStorage {
         try {
           console.log(`[Distock][${laneLabel}] Chunk ${chunkIndex}/${totalChunks - 1} (tentative ${attempts}) — ${((end - start) / 1024 / 1024).toFixed(1)} MB`);
           const startTime = Date.now();
+          let data: any;
 
-          const formData = new FormData();
-          formData.append('payload_json', JSON.stringify({}));
-          formData.append('file', chunkBlob, chunkName);
+          // ─── Strategy: Extension proxy first, direct fetch as fallback ───
+          if (hasExtensionProxy()) {
+            try {
+              data = await uploadChunkViaExtension(client.webhookUrl, chunkBlob, chunkName);
+              console.log(`[Distock][${laneLabel}] ✓ Chunk ${chunkIndex} uploadé via extension proxy`);
+            } catch (extErr: any) {
+              // Handle rate limit from extension proxy
+              if (extErr.message?.startsWith('RATE_LIMITED:')) {
+                const waitSec = parseInt(extErr.message.split(':')[1]) || 2;
+                console.warn(`[Distock][${laneLabel}] Rate limited via extension. Waiting ${waitSec}s...`);
+                await sleep(waitSec * 1000 + 500);
+                throw extErr; // Go to retry loop
+              }
+              console.warn(`[Distock][${laneLabel}] Extension proxy failed: ${extErr.message}. Trying direct fetch...`);
+              // Fall through to direct fetch below
+              data = null;
+            }
+          }
 
-          const response = await client.fetchWithRateLimit('?wait=true', {
-            method: 'POST',
-            body: formData,
-            signal: controller.signal
-          });
+          // Direct fetch fallback (if extension proxy unavailable or failed)
+          if (!data) {
+            const formData = new FormData();
+            formData.append('payload_json', JSON.stringify({}));
+            formData.append('file', chunkBlob, chunkName);
+
+            const response = await client.fetchWithRateLimit('?wait=true', {
+              method: 'POST',
+              body: formData,
+              signal: controller.signal
+            });
+            data = await response.json();
+          }
 
           clearTimeout(timeout);
           if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
 
-          const data = await response.json();
           const elapsed = Date.now() - startTime;
           const speed = ((end - start) / 1024 / 1024) / (elapsed / 1000);
-
           console.log(`[Distock][${laneLabel}] ✓ Chunk ${chunkIndex} uploadé en ${(elapsed / 1000).toFixed(1)}s (${speed.toFixed(1)} MB/s)`);
 
-          // Minimal delay to avoid burst (rate limiter handles the rest)
+          // Minimal delay to avoid burst
           if (elapsed < 500) {
             await sleep(500 - elapsed);
           }
