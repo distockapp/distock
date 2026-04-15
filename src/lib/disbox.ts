@@ -187,7 +187,21 @@ class DiscordWebhookClient {
       await sleep(this.rateLimitWaits[type]);
     }
 
-    const response = await fetch(`${this.baseUrl}${path}`, { method, body });
+    let response: Response;
+    try {
+      response = await fetch(`${this.baseUrl}${path}`, { method, body });
+    } catch (err: any) {
+      // Discord completely omits CORS headers on 429 HTTP responses, causing standard JS fetch() 
+      // to forcefully crash with a TypeError (CORS blocked) instead of returning the 429 logic.
+      if (err.name === 'TypeError' || err.message.includes('Failed to fetch')) {
+         const backoffTime = 5000;
+         console.warn(`[Distock][${this.label}] Network/CORS crash! (Likely a brutal 429 Rate Limit). Backing off for ${backoffTime/1000}s`);
+         this.rateLimitWaits[type] = backoffTime;
+         await sleep(backoffTime);
+         return await this.fetchFromApi(path, { type, method, body });
+      }
+      throw err;
+    }
 
     // Read Discord's rate limit headers
     const remaining = Number(response.headers.get('X-RateLimit-Remaining'));
@@ -196,7 +210,7 @@ class DiscordWebhookClient {
 
     if (response.status === 429) {
       const data = await response.json();
-      const retryAfter = data.retry_after;
+      const retryAfter = data.retry_after || 5; // Fallback just in case
       this.rateLimitWaits[type] = retryAfter * 1000;
       console.warn(`[Distock][${this.label}] 429 rate limited — retrying after ${retryAfter}s`);
       return await this.fetchFromApi(path, { type, method, body });
