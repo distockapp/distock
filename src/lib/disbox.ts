@@ -296,9 +296,13 @@ class DiscordFileStorage {
         attempts++;
         try {
           const startTime = Date.now();
-          console.log(`[Distock][SingleHook] Chunk ${index}/${totalChunks - 1} (Attempt ${attempts})...`);
+          console.log(`[Distock][SingleHook v4.1] Chunk ${index}/${totalChunks - 1} (Attempt ${attempts})...`);
 
           result = await this.webhookClient.sendAttachment(chunkLabel, new Blob([chunk]));
+          
+          if (!result || !result.id) {
+             throw new Error(`Discord API returned invalid response (No ID): ${JSON.stringify(result)}`);
+          }
 
           const elapsed = (Date.now() - startTime) / 1000;
           const speed = (chunk.byteLength / 1024 / 1024) / Math.max(elapsed, 0.1);
@@ -315,6 +319,9 @@ class DiscordFileStorage {
         }
       }
 
+      if (!result || !result.id) {
+        throw new Error(`Result is irrevocably undefined after loop!`);
+      }
       messageIds.push(result.id);
       uploadedBytes += chunk.byteLength;
       index++;
