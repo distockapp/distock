@@ -3,7 +3,7 @@ import { useLocation } from 'react-router-dom';
 import { Download, File as FileIcon, AlertTriangle, Folder as FolderIcon, FileText, Image, Film, Music, Archive as ArchiveIcon } from 'lucide-react';
 import { formatSize } from '../lib/utils';
 import pako from 'pako';
-import { fetchProxiedChunk } from '../lib/disbox';
+import { fetchUrl } from '../lib/disbox';
 import { toast } from 'sonner';
 import JSZip from 'jszip';
 
@@ -22,7 +22,7 @@ export function SharePage() {
         
         if (params.has('manifest')) {
            const manifestUrl = params.get('manifest')!;
-           const blob = await fetchProxiedChunk(manifestUrl);
+           const blob = await fetchUrl(manifestUrl);
            const buffer = await blob.arrayBuffer();
            const decompressed = pako.inflate(new Uint8Array(buffer), { to: 'string' });
            const manifest = JSON.parse(decompressed);
@@ -78,7 +78,7 @@ export function SharePage() {
         const writable = await handle.createWritable();
         
         for (const url of fileDetails.urls) {
-          const chunkBlob = await fetchProxiedChunk(url);
+          const chunkBlob = await fetchUrl(url);
           const chunkData = new Uint8Array(await chunkBlob.arrayBuffer());
           await writable.write(chunkData);
           chunksDownloadedBytes += chunkData.byteLength;
@@ -89,7 +89,7 @@ export function SharePage() {
         // Fallback for Firefox/Safari
         const chunks: ArrayBuffer[] = [];
         for (const url of fileDetails.urls) {
-          const chunkBlob = await fetchProxiedChunk(url);
+          const chunkBlob = await fetchUrl(url);
           const chunkData = await chunkBlob.arrayBuffer();
           chunks.push(chunkData);
           chunksDownloadedBytes += chunkData.byteLength;
@@ -125,7 +125,7 @@ export function SharePage() {
       for (const f of folderDetails.files) {
          const chunks: ArrayBuffer[] = [];
          for (const u of f.urls) {
-             const chunkBlob = await fetchProxiedChunk(u);
+             const chunkBlob = await fetchUrl(u);
              const chunkData = await chunkBlob.arrayBuffer();
              chunks.push(chunkData);
              downloadedBytes += chunkData.byteLength;
@@ -157,7 +157,7 @@ export function SharePage() {
       toast.info(`Téléchargement de ${f.name}...`);
       const chunks: ArrayBuffer[] = [];
       for (const u of f.urls) {
-         const chunkBlob = await fetchProxiedChunk(u);
+         const chunkBlob = await fetchUrl(u);
          chunks.push(await chunkBlob.arrayBuffer());
       }
       const a = document.createElement('a');

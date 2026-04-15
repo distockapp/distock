@@ -1,25 +1,19 @@
-// Content Script — injecté dans les pages Distock
-// Pont entre la page web et le service worker de l'extension
+// Distock Extension — Content Script
+// Bridge between the Distock page and the extension's background.js
+// Handles ONLY download proxying — uploads go direct to Discord
 
 (function() {
-  // Inject flag into the page's main world (content scripts are isolated)
+  // Inject extension detection flag into the page's main world
   const script = document.createElement('script');
-  script.textContent = `
-    window.__DISTOCK_EXTENSION__ = true;
-    window.__DISTOCK_EXTENSION_VERSION__ = "${chrome.runtime.getManifest().version}";
-  `;
+  script.textContent = `window.__DISTOCK_EXTENSION__ = true;`;
   (document.head || document.documentElement).appendChild(script);
   script.remove();
 
-  // ─── Upload Proxy Relay ──────────────────────────────────────────────
-  // Relaye les requêtes d'upload de la page vers le background.js
-  // et renvoie les réponses à la page.
-
+  // Listen for download proxy requests from the page
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
     if (!event.data || event.data.source !== 'DISTOCK_PAGE') return;
 
-    // Handle PING
     if (event.data.type === 'PING') {
       chrome.runtime.sendMessage({ type: 'DISTOCK_PING' }, (response) => {
         window.postMessage({
@@ -31,32 +25,24 @@
       return;
     }
 
-    // Handle UPLOAD_CHUNK — relay binary data to background.js
-    if (event.data.type === 'UPLOAD_CHUNK') {
-      const { requestId, webhookUrl, chunkData, chunkName } = event.data;
-      
+    // Download proxy: page asks us to fetch a URL (bypasses CORS on CDN)
+    if (event.data.type === 'FETCH_URL') {
+      const { requestId, url } = event.data;
+
       chrome.runtime.sendMessage({
-        type: 'DISTOCK_UPLOAD_CHUNK',
-        webhookUrl,
-        chunkData,  // ArrayBuffer — supported via structured cloning (Chrome 133+)
-        chunkName
+        type: 'DISTOCK_FETCH_URL',
+        url: url
       }, (response) => {
-        // Relay the response back to the page
         window.postMessage({
           source: 'DISTOCK_EXTENSION',
-          type: 'UPLOAD_RESULT',
-          requestId,
-          ...response
+          type: 'FETCH_RESULT',
+          requestId: requestId,
+          data: response?.data || null
         }, '*');
       });
       return;
     }
   });
 
-  // Annonce immédiate à la page que l'extension est là
-  window.dispatchEvent(new CustomEvent('distock-extension-ready', {
-    detail: { version: chrome.runtime.getManifest().version }
-  }));
-
-  console.log(`[Distock Extension v${chrome.runtime.getManifest().version}] Actif — Proxy Upload Discord activé.`);
+  console.log('[Distock Extension] Content script loaded — download proxy ready.');
 })();

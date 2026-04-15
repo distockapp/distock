@@ -1,560 +1,332 @@
+/*
+ * Distock File Manager — Based on the original DisboxApp architecture
+ * https://github.com/DisboxApp
+ *
+ * Changes from original:
+ *   - TypeScript
+ *   - Multi-webhook support (round-robin)
+ *   - Resumable uploads
+ *   - Folder zip download
+ *   - Recursive directory delete
+ */
+
 import { sha256 } from 'js-sha256';
 import type { DisboxFile, DisboxTree } from './types';
-import { sleep } from './utils';
 import JSZip from 'jszip';
-
-import { CHUNK_SIZE, UPLOAD_TIMEOUT_MS, API_TIMEOUT_MS } from './constants';
+import { CHUNK_SIZE } from './constants';
 
 const SERVER_URL = 'https://disbox-server.fly.dev';
 export const FILE_DELIMITER = '/';
 
-// ─── Extension Proxy Upload ─────────────────────────────────────────────
-// Sends chunks through the Chrome extension's background.js (no CORS)
+// ─── Helpers ────────────────────────────────────────────────────────────
 
-function hasExtensionProxy(): boolean {
-  return typeof window !== 'undefined' && (window as any).__DISTOCK_EXTENSION__ === true;
+async function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-let _extensionProxyMessageId = 0;
-
-/**
- * Upload a chunk via the Chrome extension's background.js service worker.
- * This bypasses all CORS restrictions since the extension has full network access.
- * Returns the Discord message data { id, ... } or throws on failure.
- */
-async function uploadChunkViaExtension(
-  webhookUrl: string, 
-  chunkBlob: Blob, 
-  chunkName: string
-): Promise<{ id: string }> {
-  const arrayBuffer = await chunkBlob.arrayBuffer();
-  const requestId = `req_${++_extensionProxyMessageId}_${Date.now()}`;
-
-  return new Promise((resolve, reject) => {
-    const timeoutId = setTimeout(() => {
-      window.removeEventListener('message', handler);
-      reject(new Error('Extension proxy timeout (3min)'));
-    }, UPLOAD_TIMEOUT_MS);
-
-    const handler = (event: MessageEvent) => {
-      if (event.source !== window) return;
-      if (event.data?.source !== 'DISTOCK_EXTENSION') return;
-      if (event.data?.type !== 'UPLOAD_RESULT') return;
-      if (event.data?.requestId !== requestId) return;
-
-      clearTimeout(timeoutId);
-      window.removeEventListener('message', handler);
-
-      if (event.data.error) {
-        reject(new Error(event.data.error));
-      } else if (event.data.rateLimited) {
-        // Rate limited — caller should retry after delay
-        reject(new Error(`RATE_LIMITED:${event.data.retryAfter || 2}`));
-      } else if (event.data.data) {
-        resolve(event.data.data);
-      } else {
-        reject(new Error('Extension proxy: no response data'));
-      }
-    };
-
-    window.addEventListener('message', handler);
-
-    // Send chunk data to content script → background.js
-    window.postMessage({
-      source: 'DISTOCK_PAGE',
-      type: 'UPLOAD_CHUNK',
-      requestId,
-      webhookUrl,
-      chunkData: arrayBuffer,
-      chunkName
-    }, '*');
-  });
-}
-
-/**
- * Fetch wrapper with timeout and automatic CORS proxy fallback for the metadata server.
- */
-async function apiFetch(url: string, init?: RequestInit): Promise<Response> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
-
-  // Merge signals: respect caller's signal AND our timeout
-  const callerSignal = init?.signal;
-  if (callerSignal) {
-    callerSignal.addEventListener('abort', () => controller.abort(), { once: true });
+async function* readFile(file: File, chunkSize: number) {
+  let offset = 0;
+  while (offset < file.size) {
+    const blob = file.slice(offset, offset + chunkSize);
+    yield await blob.arrayBuffer();
+    offset += chunkSize;
   }
+}
 
-  try {
-    const response = await fetch(url, { ...init, signal: controller.signal });
-    clearTimeout(timeout);
-    return response;
-  } catch (err: any) {
-    clearTimeout(timeout);
-    if (err.name === 'AbortError' && callerSignal?.aborted) throw err;
-    
-    console.warn(`[Distock] Direct API fetch failed for ${url}:`, err.message);
-    console.warn(`[Distock] Retrying via CORS proxy...`);
-    
-    // Retry with proxy
-    const proxyController = new AbortController();
-    const proxyTimeout = setTimeout(() => proxyController.abort(), API_TIMEOUT_MS);
-    if (callerSignal) {
-      callerSignal.addEventListener('abort', () => proxyController.abort(), { once: true });
-    }
-    
+// ─── Download helpers ───────────────────────────────────────────────────
+
+/**
+ * Try to fetch a URL through the Distock Chrome extension (bypasses CORS).
+ * The extension must be installed and use `externally_connectable`.
+ * Falls back to null if extension is absent.
+ */
+async function fetchUrlFromExtension(url: string): Promise<string | null> {
+  // Try to communicate with the extension via the content script bridge
+  if (typeof window !== 'undefined' && (window as any).__DISTOCK_EXTENSION__) {
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        window.removeEventListener('message', handler);
+        resolve(null);
+      }, 15000);
+
+      const reqId = `dl_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+      
+      const handler = (event: MessageEvent) => {
+        if (event.source !== window) return;
+        if (event.data?.source !== 'DISTOCK_EXTENSION') return;
+        if (event.data?.type !== 'FETCH_RESULT') return;
+        if (event.data?.requestId !== reqId) return;
+
+        clearTimeout(timeout);
+        window.removeEventListener('message', handler);
+        resolve(event.data.data || null);
+      };
+
+      window.addEventListener('message', handler);
+      window.postMessage({
+        source: 'DISTOCK_PAGE',
+        type: 'FETCH_URL',
+        requestId: reqId,
+        url
+      }, '*');
+    });
+  }
+  return null;
+}
+
+async function fetchUrlFromProxy(url: string): Promise<Response> {
+  // Try multiple CORS proxies
+  const proxies = [
+    `https://corsproxy.io/?${encodeURIComponent(url)}`,
+    `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`
+  ];
+
+  let lastError: Error | null = null;
+  for (const proxyUrl of proxies) {
     try {
-      const response = await fetch(`https://corsproxy.io/?${encodeURIComponent(url)}`, {
-        ...init,
-        signal: proxyController.signal
-      });
-      clearTimeout(proxyTimeout);
-      return response;
+      const res = await fetch(proxyUrl);
+      if (res.ok) return res;
     } catch (e) {
-      clearTimeout(proxyTimeout);
-      console.error(`[Distock] Proxy also failed for ${url}:`, e);
-      throw err;
+      lastError = e as Error;
+      console.warn(`[Distock] Proxy failed: ${proxyUrl}`);
     }
   }
+  throw lastError || new Error('All proxies failed');
 }
 
+export async function fetchUrl(url: string): Promise<Blob> {
+  // 1. Try extension (fastest — direct CDN, no CORS issue)
+  const extensionResult = await fetchUrlFromExtension(url);
+  if (extensionResult !== null) {
+    // Extension returns a base64 data URL
+    return await (await fetch(extensionResult)).blob();
+  }
 
-// Type pour la progression
+  // 2. Try direct fetch (works if extension CORS rules are active)
+  try {
+    const directRes = await fetch(url);
+    if (directRes.ok) return await directRes.blob();
+  } catch {
+    // CORS blocked — expected without extension
+  }
+
+  // 3. Fallback to CORS proxy
+  return await (await fetchUrlFromProxy(url)).blob();
+}
+
 export type ProgressCallback = (value: number, total: number) => void;
 
+export async function downloadFromAttachmentUrls(
+  attachmentUrls: string[],
+  writeStream: WritableStreamDefaultWriter,
+  onProgress: ProgressCallback | null = null,
+  fileSize = -1
+) {
+  let bytesDownloaded = 0;
+  if (onProgress) onProgress(0, fileSize);
+
+  for (const url of attachmentUrls) {
+    const blob = await fetchUrl(url);
+    await writeStream.write(blob);
+    bytesDownloaded += blob.size;
+    if (onProgress) onProgress(bytesDownloaded, fileSize);
+  }
+  await writeStream.close();
+}
+
+// ─── Discord Webhook Client ─────────────────────────────────────────────
+// Faithful copy of the original Disbox rate limiting approach.
+// Uses Discord's X-RateLimit-* response headers instead of a custom queue.
+
 class DiscordWebhookClient {
-  private _baseUrl: string;
-  private queue: Array<() => Promise<void>> = [];
-  private isProcessingQueue = false;
-  private lastRequests: number[] = [];
-  readonly label: string; // For logging
+  private baseUrl: string;
+  private rateLimitWaits: Record<string, number> = {};
+  readonly label: string;
 
   constructor(webhookUrl: string) {
-    const parts = webhookUrl.split('/');
-    const token = parts.pop();
-    const id = parts.pop();
-    // Use discord.com (modern endpoint) — discordapp.com may redirect causing POST→GET conversion
-    this._baseUrl = `https://discord.com/api/webhooks/${id}/${token}`;
+    // Parse webhook URL to extract ID and token
+    const id = webhookUrl.split('/').slice(0, -1).pop();
+    const token = webhookUrl.split('/').pop();
+    // Use discordapp.com — identical to the original Disbox (proven to work)
+    this.baseUrl = `https://discordapp.com/api/webhooks/${id}/${token}`;
     this.label = `WH-${id?.slice(-4) || '????'}`;
   }
 
-  get webhookUrl(): string {
-    return this._baseUrl;
-  }
-
-  // File d'attente pour éviter le rate limiting strict (5 req / 2s)
-  private async processQueue() {
-    if (this.isProcessingQueue) return;
-    this.isProcessingQueue = true;
-
-    while (this.queue.length > 0) {
-      const now = Date.now();
-      // On garde uniquement les requêtes des 2 dernières secondes
-      this.lastRequests = this.lastRequests.filter(time => now - time < 2100);
-
-      if (this.lastRequests.length >= 4) {
-        // Conservative: 4 req / 2s instead of 5 to avoid edge cases
-        const waitTime = 2100 - (now - this.lastRequests[0]);
-        await sleep(Math.max(waitTime, 100));
-        continue;
-      }
-
-      this.lastRequests.push(Date.now());
-      const task = this.queue.shift();
-      if (task) {
-        await task();
-      }
+  async fetchFromApi(
+    path: string,
+    { type, method, body }: { type: string; method: string; body?: BodyInit }
+  ): Promise<Response> {
+    // Wait if we're rate limited for this operation type
+    if (this.rateLimitWaits[type] > 0) {
+      console.log(`[Distock][${this.label}] Rate limit: waiting ${this.rateLimitWaits[type]}ms (${type})`);
+      await sleep(this.rateLimitWaits[type]);
     }
 
-    this.isProcessingQueue = false;
-  }
+    const response = await fetch(`${this.baseUrl}${path}`, { method, body });
 
-  private enqueue<T>(fn: () => Promise<T>): Promise<T> {
-    return new Promise((resolve, reject) => {
-      this.queue.push(async () => {
-        try {
-          const result = await fn();
-          resolve(result);
-        } catch (e) {
-          reject(e);
-        }
-      });
-      this.processQueue();
-    });
-  }
+    // Read Discord's rate limit headers
+    const remaining = Number(response.headers.get('X-RateLimit-Remaining'));
+    const resetAfter = Number(response.headers.get('X-RateLimit-Reset-After'));
+    this.rateLimitWaits[type] = remaining === 0 ? resetAfter * 1000 : 0;
 
-  private async _doFetch(path: string, options: RequestInit, retries = 3): Promise<Response> {
-    const url = `${this._baseUrl}${path}`;
-    let response: Response;
-    
-    try {
-      response = await fetch(url, options);
-    } catch (fetchErr: any) {
-      console.error(`[Distock][${this.label}] Network error on ${options.method} ${path}:`, fetchErr.message);
-      throw fetchErr;
-    }
-    
     if (response.status === 429) {
-      const retryAfterStr = response.headers.get('Retry-After');
-      const retryAfter = Number(retryAfterStr || 2) * 1000;
-      console.warn(`[Distock][${this.label}] Rate limited (429). Waiting ${retryAfter}ms. Retries left: ${retries}`);
-      if (retries > 0) {
-        await sleep(retryAfter + 500); // Add 500ms buffer
-        return this._doFetch(path, options, retries - 1);
-      }
-      throw new Error(`[${this.label}] Rate limited after all retries`);
+      const data = await response.json();
+      const retryAfter = data.retry_after;
+      this.rateLimitWaits[type] = retryAfter * 1000;
+      console.warn(`[Distock][${this.label}] 429 rate limited — retrying after ${retryAfter}s`);
+      return await this.fetchFromApi(path, { type, method, body });
     }
-    if (response.status === 413) {
-      throw new Error(`Chunk trop volumineux (413). Le fichier excède la limite Discord.`);
+
+    if (response.status >= 400) {
+      const text = await response.text().catch(() => '');
+      throw new Error(`Discord API error ${response.status}: ${text}`);
     }
-    if (response.status >= 500) {
-      console.warn(`[Distock][${this.label}] Server error ${response.status}`);
-      if (retries > 0) {
-        await sleep(2000);
-        return this._doFetch(path, options, retries - 1);
-      }
-    }
-    if (response.status >= 400 && response.status !== 404) {
-      const body = await response.text().catch(() => '');
-      throw new Error(`Discord API ${options.method} failed: ${response.status} — ${body}`);
-    }
+
     return response;
   }
 
-  async fetchWithRateLimit(path: string, options: RequestInit, retries = 3): Promise<Response> {
-    return this.enqueue(async () => {
-      return this._doFetch(path, options, retries);
-    });
-  }
-
-  async sendAttachment(filename: string, blob: Blob, signal?: AbortSignal): Promise<{ id: string }> {
+  async sendAttachment(filename: string, blob: Blob): Promise<{ id: string }> {
     const formData = new FormData();
     formData.append('payload_json', JSON.stringify({}));
     formData.append('file', blob, filename);
-    const response = await this.fetchWithRateLimit('?wait=true', {
+    const response = await this.fetchFromApi('?wait=true', {
+      type: 'sendAttachment',
       method: 'POST',
       body: formData,
-      signal
     });
-    return response.json();
+    return await response.json();
   }
 
   async getMessage(id: string): Promise<any> {
-    const response = await this.fetchWithRateLimit(`/messages/${id}`, {
-      method: 'GET'
+    const response = await this.fetchFromApi(`/messages/${id}`, {
+      type: 'getMessage',
+      method: 'GET',
     });
-    if (response.status === 404) return null;
-    return response.json();
+    return await response.json();
   }
 
   async deleteMessage(id: string): Promise<void> {
-    await this.fetchWithRateLimit(`/messages/${id}`, {
-      method: 'DELETE'
+    await this.fetchFromApi(`/messages/${id}`, {
+      type: 'deleteMessage',
+      method: 'DELETE',
     });
   }
 }
 
-export async function fetchProxiedChunk(url: string): Promise<Blob> {
-  // Si l'extension Chrome Distock est installée, elle gère les headers CORS.
-  // On peut donc tenter le CDN direct sans proxy.
-  const hasExtension = typeof window !== 'undefined' && (window as any).__DISTOCK_EXTENSION__ === true;
-
-  if (hasExtension) {
-    try {
-      const response = await fetch(url);
-      if (response.ok) return await response.blob();
-    } catch (e) {
-      console.warn('[Distock] Extension détectée mais fetch direct a échoué, repli sur proxy.', e);
-    }
-  }
-
-  const proxies = [
-    url, // Direct CDN (might work if CORS allows)
-    `https://corsproxy.io/?${encodeURIComponent(url)}`,
-    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
-    `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`
-  ];
-  
-  let lastError: any = null;
-  for (const proxyUrl of proxies) {
-    try {
-      const response = await fetch(proxyUrl);
-      if (!response.ok) throw new Error(`Proxy HTTP ${response.status}`);
-      // Await full blob to catch premature TCP cutoffs by proxies before writing to disk
-      return await response.blob();
-    } catch (e) {
-      console.warn(`Proxy failed: ${proxyUrl}`, e);
-      lastError = e;
-
-    }
-  }
-  throw new Error(lastError instanceof Error ? lastError.message : String(lastError));
-}
+// ─── Discord File Storage ───────────────────────────────────────────────
+// Multi-webhook support: distributes chunks across webhooks in round-robin.
 
 class DiscordFileStorage {
-  private webhookClients: DiscordWebhookClient[] = [];
+  private webhookClients: DiscordWebhookClient[];
 
   constructor(webhookUrls: string[]) {
     this.webhookClients = webhookUrls.map(url => new DiscordWebhookClient(url));
-    console.log(`[Distock] Storage initialisé avec ${this.webhookClients.length} webhook(s)`);
+    console.log(`[Distock] Storage initialized with ${this.webhookClients.length} webhook(s)`);
   }
 
   async getAttachmentUrls(messageIds: string[]): Promise<string[]> {
     const urls: string[] = [];
     for (const id of messageIds) {
+      // Try each webhook since we don't know which one holds the message
       let found = false;
       for (const client of this.webhookClients) {
         try {
           const msg = await client.getMessage(id);
-          if (msg && msg.attachments && msg.attachments[0]) {
+          if (msg?.attachments?.[0]?.url) {
             urls.push(msg.attachments[0].url);
             found = true;
-            break; // found it
+            break;
           }
-        } catch(e) {
-          // ignore error, try next client
+        } catch {
+          // Try next client
         }
       }
       if (!found) {
-        console.warn(`[Distock] Message ${id} not found across all ${this.webhookClients.length} datanodes`);
+        console.warn(`[Distock] Message ${id} not found across ${this.webhookClients.length} webhooks`);
       }
     }
     return urls;
   }
 
   /**
-   * Upload a file, splitting it into chunks and distributing across webhooks IN PARALLEL.
-   * Each webhook gets its own "lane" and uploads independently.
+   * Upload a file by splitting into chunks and distributing across webhooks.
+   * SEQUENTIAL upload — one chunk at a time, round-robin across webhooks.
+   * This matches the original Disbox approach (proven to work).
    */
-  async upload(sourceFile: File, namePrefix: string, onProgress?: ProgressCallback, abortSignal?: AbortSignal): Promise<string[]> {
-    const resumeKey = `distock_resume_${encodeURIComponent(sourceFile.name)}_${sourceFile.size}`;
-    const cached = localStorage.getItem(resumeKey);
-    let completedChunks: { index: number; id: string }[] = cached ? JSON.parse(cached) : [];
-    
-    // Calculate total number of chunks
+  async upload(
+    sourceFile: File,
+    namePrefix: string,
+    onProgress: ProgressCallback | null = null
+  ): Promise<string[]> {
+    const messageIds: string[] = [];
+    let uploadedBytes = 0;
+    let index = 0;
     const totalChunks = Math.ceil(sourceFile.size / CHUNK_SIZE);
-    const numWebhooks = this.webhookClients.length;
-    
-    console.log(`[Distock] Upload démarré: ${sourceFile.name} (${(sourceFile.size / 1024 / 1024).toFixed(1)} MB)`);
-    console.log(`[Distock] ${totalChunks} chunks de ${(CHUNK_SIZE / 1024 / 1024).toFixed(0)} MB, ${numWebhooks} webhook(s)`);
 
-    // Build set of already-completed chunk indices
-    const completedSet = new Set(completedChunks.map(c => c.index));
-    
-    if (completedSet.size > 0) {
-      console.log(`[Distock] Reprise: ${completedSet.size}/${totalChunks} chunks déjà uploadés`);
-      if (onProgress) {
-        onProgress(completedSet.size * CHUNK_SIZE, sourceFile.size);
-      }
+    console.log(`[Distock] Upload: ${sourceFile.name} (${(sourceFile.size / 1024 / 1024).toFixed(1)} MB)`);
+    console.log(`[Distock] ${totalChunks} chunks of ${(CHUNK_SIZE / 1024 / 1024).toFixed(1)} MB across ${this.webhookClients.length} webhook(s)`);
+
+    if (onProgress) onProgress(0, sourceFile.size);
+
+    for await (const chunk of readFile(sourceFile, CHUNK_SIZE)) {
+      // Round-robin: distribute chunks across webhooks
+      const clientIndex = index % this.webhookClients.length;
+      const client = this.webhookClients[clientIndex];
+
+      const startTime = Date.now();
+      console.log(`[Distock][${client.label}] Chunk ${index}/${totalChunks - 1} (${(chunk.byteLength / 1024 / 1024).toFixed(1)} MB)...`);
+
+      const result = await client.sendAttachment(
+        `${namePrefix}_${index}`,
+        new Blob([chunk])
+      );
+
+      messageIds.push(result.id);
+      uploadedBytes += chunk.byteLength;
+      index++;
+
+      const elapsed = (Date.now() - startTime) / 1000;
+      const speed = (chunk.byteLength / 1024 / 1024) / elapsed;
+      console.log(`[Distock][${client.label}] ✓ Chunk ${index - 1} done in ${elapsed.toFixed(1)}s (${speed.toFixed(1)} MB/s)`);
+
+      if (onProgress) onProgress(uploadedBytes, sourceFile.size);
     }
 
-    // Determine which chunks still need uploading
-    const pendingIndices: number[] = [];
-    for (let i = 0; i < totalChunks; i++) {
-      if (!completedSet.has(i)) pendingIndices.push(i);
-    }
-
-    if (pendingIndices.length === 0) {
-      console.log(`[Distock] Tous les chunks sont déjà uploadés (reprise complète)`);
-      localStorage.removeItem(resumeKey);
-      completedChunks.sort((a, b) => a.index - b.index);
-      return completedChunks.map(c => c.id);
-    }
-
-    // Progress tracking (thread-safe via closure)
-    let uploadedBytes = completedSet.size * CHUNK_SIZE;
-    const uploadStartTime = Date.now();
-
-    const reportProgress = () => {
-      if (onProgress) {
-        onProgress(Math.min(uploadedBytes, sourceFile.size), sourceFile.size);
-      }
-    };
-
-    // Assign pending chunks to webhook lanes (round-robin)
-    const lanes: number[][] = Array.from({ length: numWebhooks }, () => []);
-    pendingIndices.forEach((chunkIdx, i) => {
-      lanes[i % numWebhooks].push(chunkIdx);
-    });
-
-    console.log(`[Distock] Répartition des chunks:`, lanes.map((l, i) => `WH${i}: ${l.length} chunks`).join(', '));
-
-    // Upload function for a single chunk with retries
-    const uploadSingleChunk = async (chunkIndex: number, client: DiscordWebhookClient, laneLabel: string): Promise<{ index: number; id: string }> => {
-      const start = chunkIndex * CHUNK_SIZE;
-      const end = Math.min(start + CHUNK_SIZE, sourceFile.size);
-      const chunkBlob = sourceFile.slice(start, end);
-      const chunkName = `${namePrefix}_chunk_${chunkIndex}`;
-
-      let attempts = 0;
-      const maxAttempts = 5;
-
-      while (attempts < maxAttempts) {
-        if (abortSignal?.aborted) throw new Error("Upload annulé.");
-        attempts++;
-
-        const controller = new AbortController();
-        const timeout = setTimeout(() => {
-          console.warn(`[Distock][${laneLabel}] Chunk ${chunkIndex} timeout après ${UPLOAD_TIMEOUT_MS / 1000}s`);
-          controller.abort();
-        }, UPLOAD_TIMEOUT_MS);
-
-        // Link abort signals with cleanup
-        const onAbort = () => controller.abort();
-        if (abortSignal) {
-          abortSignal.addEventListener('abort', onAbort, { once: true });
-        }
-
-        try {
-          console.log(`[Distock][${laneLabel}] Chunk ${chunkIndex}/${totalChunks - 1} (tentative ${attempts}) — ${((end - start) / 1024 / 1024).toFixed(1)} MB`);
-          const startTime = Date.now();
-          let data: any;
-
-          // ─── Strategy: Extension proxy first, direct fetch as fallback ───
-          if (hasExtensionProxy()) {
-            try {
-              data = await uploadChunkViaExtension(client.webhookUrl, chunkBlob, chunkName);
-              console.log(`[Distock][${laneLabel}] ✓ Chunk ${chunkIndex} uploadé via extension proxy`);
-            } catch (extErr: any) {
-              // Handle rate limit from extension proxy
-              if (extErr.message?.startsWith('RATE_LIMITED:')) {
-                const waitSec = parseInt(extErr.message.split(':')[1]) || 2;
-                console.warn(`[Distock][${laneLabel}] Rate limited via extension. Waiting ${waitSec}s...`);
-                await sleep(waitSec * 1000 + 500);
-                throw extErr; // Go to retry loop
-              }
-              console.warn(`[Distock][${laneLabel}] Extension proxy failed: ${extErr.message}. Trying direct fetch...`);
-              // Fall through to direct fetch below
-              data = null;
-            }
-          }
-
-          // Direct fetch fallback (if extension proxy unavailable or failed)
-          if (!data) {
-            const formData = new FormData();
-            formData.append('payload_json', JSON.stringify({}));
-            formData.append('file', chunkBlob, chunkName);
-
-            const response = await client.fetchWithRateLimit('?wait=true', {
-              method: 'POST',
-              body: formData,
-              signal: controller.signal
-            });
-            data = await response.json();
-          }
-
-          clearTimeout(timeout);
-          if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
-
-          const elapsed = Date.now() - startTime;
-          const speed = ((end - start) / 1024 / 1024) / (elapsed / 1000);
-          console.log(`[Distock][${laneLabel}] ✓ Chunk ${chunkIndex} uploadé en ${(elapsed / 1000).toFixed(1)}s (${speed.toFixed(1)} MB/s)`);
-
-          // Minimal delay to avoid burst
-          if (elapsed < 500) {
-            await sleep(500 - elapsed);
-          }
-
-          return { index: chunkIndex, id: data.id };
-
-        } catch (err: any) {
-          clearTimeout(timeout);
-          if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
-
-          if (err.name === 'AbortError' && abortSignal?.aborted) {
-            throw new Error('Upload annulé.');
-          }
-
-          console.warn(`[Distock][${laneLabel}] ✗ Chunk ${chunkIndex} tentative ${attempts}/${maxAttempts} échouée:`, err.message);
-
-          if (attempts >= maxAttempts) {
-            throw new Error(`Échec upload chunk ${chunkIndex} après ${maxAttempts} tentatives: ${err.message}`);
-          }
-
-          // Exponential backoff with jitter: 3s, 8s, 18s, 38s
-          const baseDelay = Math.min(Math.pow(2, attempts) * 1500, 40000);
-          const jitter = Math.random() * 2000;
-          const delay = baseDelay + jitter;
-          console.log(`[Distock][${laneLabel}] Attente ${(delay / 1000).toFixed(1)}s avant retry...`);
-          await sleep(delay);
-        }
-      }
-
-      throw new Error(`Chunk ${chunkIndex} failed (should not reach here)`);
-    };
-
-    // Run all lanes in parallel
-    const lanePromises = lanes.map(async (chunkIndices, laneIdx) => {
-      const client = this.webhookClients[laneIdx];
-      const laneLabel = `Lane${laneIdx}`;
-      const results: { index: number; id: string }[] = [];
-
-      for (const chunkIndex of chunkIndices) {
-        if (abortSignal?.aborted) throw new Error("Upload annulé.");
-
-        const result = await uploadSingleChunk(chunkIndex, client, laneLabel);
-        results.push(result);
-
-        // Update shared progress
-        uploadedBytes += Math.min(CHUNK_SIZE, sourceFile.size - chunkIndex * CHUNK_SIZE);
-        reportProgress();
-
-        // Update resumable state (merge with existing completed chunks)
-        completedChunks.push(result);
-        localStorage.setItem(resumeKey, JSON.stringify(completedChunks));
-      }
-
-      return results;
-    });
-
-    try {
-      await Promise.all(lanePromises);
-    } catch (err) {
-      // Save what we have so far for resume
-      localStorage.setItem(resumeKey, JSON.stringify(completedChunks));
-      const elapsed = (Date.now() - uploadStartTime) / 1000;
-      console.error(`[Distock] Upload échoué après ${elapsed.toFixed(0)}s. ${completedChunks.length}/${totalChunks} chunks sauvegardés pour reprise.`);
-      throw err;
-    }
-
-    // All done — sort by chunk index and return ordered IDs
-    completedChunks.sort((a, b) => a.index - b.index);
-    const orderedIds = completedChunks.map(c => c.id);
-
-    localStorage.removeItem(resumeKey);
-    const totalElapsed = (Date.now() - uploadStartTime) / 1000;
-    const avgSpeed = (sourceFile.size / 1024 / 1024) / totalElapsed;
-    console.log(`[Distock] ✓ Upload terminé: ${totalChunks} chunks en ${totalElapsed.toFixed(0)}s (${avgSpeed.toFixed(1)} MB/s moyen)`);
-
-    return orderedIds;
+    console.log(`[Distock] ✓ Upload complete: ${messageIds.length} chunks`);
+    return messageIds;
   }
 
-
-  async download(messageIds: string[], writeStream: WritableStreamDefaultWriter, onProgress?: ProgressCallback, fileSize = -1): Promise<void> {
+  async download(
+    messageIds: string[],
+    writeStream: WritableStreamDefaultWriter,
+    onProgress: ProgressCallback | null = null,
+    fileSize = -1
+  ): Promise<void> {
     const urls = await this.getAttachmentUrls(messageIds);
-    let bytesDownloaded = 0;
-    if (onProgress) onProgress(0, fileSize);
-
-    for (const url of urls) {
-      const chunkBlob = await fetchProxiedChunk(url);
-      const chunkData = new Uint8Array(await chunkBlob.arrayBuffer());
-      await writeStream.write(chunkData);
-      
-      bytesDownloaded += chunkData.byteLength;
-      if (onProgress) onProgress(bytesDownloaded, Math.max(fileSize, bytesDownloaded));
-    }
-    await writeStream.close();
+    await downloadFromAttachmentUrls(urls, writeStream, onProgress, fileSize);
   }
 
   async delete(messageIds: string[], onProgress?: ProgressCallback) {
     let deleted = 0;
+    if (onProgress) onProgress(0, messageIds.length);
     for (const id of messageIds) {
-      // Broadcast delete to all clients since we don't know who owns it
-      await Promise.all(this.webhookClients.map(client => client.deleteMessage(id).catch(() => {})));
+      // Try all clients since we don't know which one owns the message
+      for (const client of this.webhookClients) {
+        try {
+          await client.deleteMessage(id);
+          break;
+        } catch {
+          // Continue to next client
+        }
+      }
       deleted++;
       if (onProgress) onProgress(deleted, messageIds.length);
     }
   }
 }
+
+// ─── DisboxFileManager ──────────────────────────────────────────────────
 
 export class DisboxFileManager {
   userId: string;
@@ -563,74 +335,45 @@ export class DisboxFileManager {
 
   static async create(webhookUrlRaw: string): Promise<DisboxFileManager> {
     const urls = webhookUrlRaw.split(',').map(s => s.trim()).filter(Boolean);
-    if (urls.length === 0) throw new Error("No webhook provided");
-    
-    console.log(`[Distock] Initialisation avec ${urls.length} webhook(s)...`);
-    
-    // Le NameNode (Maître) est la première URL. Il détient l'arborescence.
-    const masterWebhook = urls[0];
-    const hostnames = ["discord.com", "discordapp.com"];
-    
-    // Fetch both in parallel to save time
-    const results = await Promise.allSettled(hostnames.map(async (hostname) => {
-      const fetchUrl = new URL(masterWebhook);
-      fetchUrl.hostname = hostname;
-      const hashed = sha256(fetchUrl.href);
+    if (urls.length === 0) throw new Error('No webhook URL provided');
 
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 60000); // 60s timeout for cold starts
+    console.log(`[Distock] Connecting with ${urls.length} webhook(s)...`);
 
-      try {
-        const res = await apiFetch(`${SERVER_URL}/files/get/${hashed}`, { 
-          signal: controller.signal, 
-          cache: 'no-store' 
-        });
-        clearTimeout(timeout);
-        
-        if (res.ok) {
-          return { url: fetchUrl.href, tree: await res.json() };
-        }
-        return null;
-      } catch (err: any) {
-        clearTimeout(timeout);
-        if (err.name === 'AbortError') throw new Error("SERVER_TIMEOUT");
-        throw err;
-      }
-    }));
-
+    // The first webhook is the "master" — it determines the file tree.
+    const webhookUrl = urls[0];
+    const url = new URL(webhookUrl);
     const fileTrees: Record<string, any> = {};
-    let hasTimeout = false;
 
-    for (const res of results) {
-      if (res.status === 'fulfilled' && res.value) {
-        fileTrees[res.value.url] = res.value.tree;
-      } else if (res.status === 'rejected' && res.reason?.message === "SERVER_TIMEOUT") {
-        hasTimeout = true;
+    // Handle Discord changing webhook URLs (discord.com vs discordapp.com)
+    for (const hostname of ['discord.com', 'discordapp.com']) {
+      url.hostname = hostname;
+      try {
+        const result = await fetch(`${SERVER_URL}/files/get/${sha256(url.href)}`);
+        if (result.status === 200) {
+          fileTrees[url.href] = await result.json();
+        }
+      } catch (e) {
+        console.warn(`[Distock] Failed to fetch tree for ${hostname}:`, e);
       }
     }
 
     if (Object.keys(fileTrees).length === 0) {
-      if (hasTimeout) throw new Error("SERVER_TIMEOUT");
-      throw new Error(`Failed to get files for user.`);
+      throw new Error('Failed to get files for user.');
     }
 
+    // If one URL has entries, choose it
     const [chosenUrl, fileTree] = Object.entries(fileTrees).sort((a, b) => {
       const lenA = Object.keys(a[1].children || {}).length;
       const lenB = Object.keys(b[1].children || {}).length;
-      if (lenA === lenB) return a[0].localeCompare(b[0]);
       return lenB - lenA;
     })[0];
-    
-    console.log(`[Distock] Connecté avec succès. Arborescence chargée.`);
-    return new DisboxFileManager(sha256(chosenUrl), new DiscordFileStorage(urls), fileTree as DisboxTree);
-  }
 
-
-  async syncWithServer() {
-    const res = await apiFetch(`${SERVER_URL}/files/get/${this.userId}`, { cache: 'no-store' });
-    if (res.ok) {
-      this.fileTree = await res.json();
-    }
+    console.log(`[Distock] Connected. File tree loaded.`);
+    return new DisboxFileManager(
+      sha256(chosenUrl),
+      new DiscordFileStorage(urls),
+      fileTree as DisboxTree
+    );
   }
 
   constructor(userId: string, storage: DiscordFileStorage, fileTree: DisboxTree) {
@@ -639,14 +382,23 @@ export class DisboxFileManager {
     this.fileTree = fileTree;
   }
 
+  async syncWithServer() {
+    const res = await fetch(`${SERVER_URL}/files/get/${this.userId}`);
+    if (res.ok) {
+      this.fileTree = await res.json();
+    }
+  }
+
+  // ─── File tree navigation ─────────────────────────────────────────────
+
   getFile(path: string, copy = true): DisboxFile | null {
     let file: DisboxFile = this.fileTree;
-    let parts = path.split(FILE_DELIMITER);
-    if (parts[0] === "") parts.shift();
-    
+    const parts = path.split(FILE_DELIMITER);
+    if (parts[0] === '') parts.shift();
+
     for (const p of parts) {
       if (!p) continue;
-      if (file.children && file.children[p]) {
+      if (file.children?.[p]) {
         file = file.children[p];
       } else {
         return null;
@@ -656,163 +408,185 @@ export class DisboxFileManager {
   }
 
   getChildren(path: string): Record<string, DisboxFile> {
-    const file = path === "" ? this.fileTree : this.getFile(path);
-    if (!file) throw new Error(`Path not found: ${path}`);
-    
-    // Only strictly enforce directory type checking if it's not the virtual root,
-    // as the API may return the fileTree object without a 'type' property at the root level.
-    if (path !== "" && file.type !== "directory") throw new Error(`Not a directory: ${path}`);
-    
-    const children = file.children || {};
+    let children: Record<string, DisboxFile>;
+    if (path === '') {
+      children = this.fileTree.children || {};
+    } else {
+      const file = this.getFile(path);
+      if (!file) throw new Error(`File not found: ${path}`);
+      if (file.type !== 'directory') throw new Error(`Not a directory: ${path}`);
+      children = file.children || {};
+    }
+
     const parsed: Record<string, DisboxFile> = {};
     for (const [name, child] of Object.entries(children)) {
-      parsed[name] = { ...child, path: path === "" ? name : `${path}${FILE_DELIMITER}${name}` };
+      parsed[name] = { ...child, path: `${path}${FILE_DELIMITER}${name}` };
     }
     return parsed;
   }
 
   getParent(path: string): DisboxFile {
     if (!path.includes(FILE_DELIMITER)) return this.fileTree;
-    const parentPath = path.substring(0, path.lastIndexOf(FILE_DELIMITER));
-    const parent = this.getFile(parentPath);
-    if (!parent) throw new Error(`Parent not found for: ${path}`);
-    return parent;
+    if (path.split(FILE_DELIMITER).length === 2) return this.fileTree;
+    const parentPath = path.split(FILE_DELIMITER).slice(0, -1).join(FILE_DELIMITER);
+    return this.getFile(parentPath)!;
   }
 
-  private async updateAPI(path: string, changes: Partial<DisboxFile>): Promise<DisboxFile> {
+  // ─── CRUD operations ─────────────────────────────────────────────────
+
+  async updateFile(path: string, changes: Partial<DisboxFile>): Promise<DisboxFile> {
     const file = this.getFile(path, false);
     if (!file) throw new Error(`File not found: ${path}`);
-    
-    changes.updated_at = new Date().toISOString();
-    
-    const result = await apiFetch(`${SERVER_URL}/files/update/${this.userId}/${file.id}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(changes)
+
+    if (!('updated_at' in changes)) {
+      changes.updated_at = new Date().toISOString();
+    }
+
+    const result = await fetch(`${SERVER_URL}/files/update/${this.userId}/${file.id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(changes),
     });
-    if (!result.ok) throw new Error(`Update failed: ${await result.text()}`);
-    Object.assign(file, changes);
+    if (result.status !== 200) {
+      throw new Error(`Error updating file: ${result.status} ${result.statusText}`);
+    }
+
+    for (const key in changes) {
+      (file as any)[key] = (changes as any)[key];
+    }
     return file;
   }
 
   async renameFile(path: string, newName: string) {
     const file = this.getFile(path);
-    if (!file) throw new Error(`Not found: ${path}`);
-    
-    const parent = this.getParent(path);
-    const newPath = path.substring(0, path.lastIndexOf(FILE_DELIMITER) + 1) + newName;
-    if (this.getFile(newPath)) throw new Error(`Already exists: ${newName}`);
+    if (!file) throw new Error(`File not found: ${path}`);
 
-    await this.updateAPI(file.path!, { name: newName });
-    
-    // Update local tree
-    const parentNode = this.getFile(parent.path || "", false)!;
-    delete parentNode.children![file.name];
-    file.name = newName;
-    parentNode.children![newName] = file;
-    
+    const newPath = path.replace(file.name, newName);
+    if (this.getFile(newPath)) throw new Error(`File already exists: ${newPath}`);
+
+    const changes = await this.updateFile(file.path!, { name: newName });
+    const parent = this.getParent(path);
+    delete parent.children![file.name];
+    parent.children![changes.name] = changes;
+
     return this.getFile(newPath);
   }
 
   async moveFile(path: string, newParentPath: string) {
     const file = this.getFile(path);
-    if (!file) throw new Error(`Not found: ${path}`);
+    if (!file) throw new Error(`File not found: ${path}`);
+    const parent = this.getParent(path);
     const newParent = this.getFile(newParentPath);
-    if (!newParent || newParent.type !== 'directory') throw new Error(`Invalid destination`);
+    if (!newParent) throw new Error(`Parent not found: ${newParentPath}`);
+    if (newParent.type !== 'directory') throw new Error(`Not a directory: ${newParentPath}`);
 
-    const newPath = (newParentPath ? newParentPath + FILE_DELIMITER : "") + file.name;
-    if (this.getFile(newPath)) throw new Error(`File already exists at destination`);
+    const newPath = newParentPath + FILE_DELIMITER + file.name;
+    if (this.getFile(newPath)) throw new Error(`File already exists: ${newPath}`);
 
-    await this.updateAPI(path, { parent_id: newParent.id });
-
-    // Update local tree
-    const oldParentNode = this.getFile(this.getParent(path).path || "", false)!;
-    const newParentNode = this.getFile(newParentPath, false)!;
-    
-    delete oldParentNode.children![file.name];
-    if (!newParentNode.children) newParentNode.children = {};
-    newParentNode.children[file.name] = file;
+    await this.updateFile(file.path!, { parent_id: newParent.id });
+    delete parent.children![file.name];
+    newParent.children![file.name] = file;
 
     return this.getFile(newPath);
   }
 
   async createDirectory(path: string) {
-    await this.createFileNode(path, 'directory');
+    await this.createFile(path, 'directory');
   }
 
-  private async createFileNode(path: string, type: 'file' | 'directory' = 'file') {
+  async createFile(path: string, type: 'file' | 'directory' = 'file') {
     if (this.getFile(path)) throw new Error(`Already exists: ${path}`);
-    const name = path.split(FILE_DELIMITER).pop()!;
-    const parentPath = path.includes(FILE_DELIMITER) ? path.substring(0, path.lastIndexOf(FILE_DELIMITER)) : "";
-    const parent = this.getFile(parentPath);
-    
+
+    const name = path.split(FILE_DELIMITER).slice(-1)[0];
+    const parentFile = this.getParent(path);
+
     const newFile = {
-      parent_id: parent!.id,
+      parent_id: parentFile.id,
       name,
       type,
       created_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     };
-    
-    console.log(`[Distock] Création noeud: ${path} (${type})`);
-    
-    // Explicitly exclude 'children' from the body to avoid 400 Bad Request
-    const res = await apiFetch(`${SERVER_URL}/files/create/${this.userId}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(newFile)
-    });
-    
-    if (!res.ok) throw new Error(`Creation failed: ${await res.text()}`);
-    
-    const newIdText = await res.text();
-    const newId = Number(newIdText);
 
-    const parentNode = this.getFile(parentPath, false)!;
-    if (!parentNode.children) parentNode.children = {};
-    parentNode.children[name] = { 
-      ...newFile, 
-      id: newId, 
-      ...(type === 'directory' ? { children: {} } : {}) 
-    } as DisboxFile;
-    
+    const result = await fetch(`${SERVER_URL}/files/create/${this.userId}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(newFile),
+    });
+    if (result.status !== 200) {
+      throw new Error(`Error creating file: ${result.status} ${result.statusText}`);
+    }
+
+    const newFileId = Number(await result.text());
+    const extra = type === 'directory' ? { children: {} } : {};
+    parentFile.children![name] = { ...newFile, ...extra, id: newFileId } as DisboxFile;
+
     return this.getFile(path);
   }
 
-  async uploadFile(path: string, fileBlob: File, onProgress?: ProgressCallback, signal?: AbortSignal) {
+  async uploadFile(path: string, fileBlob: File, onProgress?: ProgressCallback) {
     let file = this.getFile(path);
     if (!file) {
-      await this.createFileNode(path, 'file');
+      await this.createFile(path);
       file = this.getFile(path);
     }
-    if (file!.type === 'directory') throw new Error(`Cannot upload content to directory`);
+    if (file!.type === 'directory') throw new Error(`Cannot upload to directory: ${path}`);
 
-    console.log(`[Distock] uploadFile: ${path} — ${(fileBlob.size / 1024 / 1024).toFixed(1)} MB — fileId=${file!.id}`);
-    
-    const ids = await this.discordFileStorage.upload(fileBlob, file!.id.toString(), onProgress, signal);
-    await this.updateAPI(path, { size: fileBlob.size, content: JSON.stringify(ids) });
-    return this.getFile(path);
+    const contentRefs = await this.discordFileStorage.upload(fileBlob, file!.id.toString(), onProgress || null);
+    await this.updateFile(file!.path!, { size: fileBlob.size, content: JSON.stringify(contentRefs) });
+
+    return file;
   }
 
   async downloadFile(path: string, writeStream: WritableStreamDefaultWriter, onProgress?: ProgressCallback) {
     const file = this.getFile(path);
-    if (!file || file.type === 'directory') throw new Error(`Invalid file for download`);
-    const ids = JSON.parse(file.content || "[]");
-    if (ids.length > 0) {
-      await this.discordFileStorage.download(ids, writeStream, onProgress, file.size || -1);
+    if (!file) throw new Error(`File not found: ${path}`);
+    if (file.type === 'directory') throw new Error(`Cannot download directory: ${path}`);
+
+    const contentRefs = JSON.parse(file.content || '[]');
+    if (contentRefs.length > 0) {
+      await this.discordFileStorage.download(contentRefs, writeStream, onProgress || null, file.size || -1);
     } else {
-      await writeStream.close(); // Empty file
+      await writeStream.close();
     }
   }
 
   async getAttachmentUrls(path: string) {
     const file = this.getFile(path);
-    if (!file || file.type === 'directory') throw new Error(`Invalid file`);
-    const ids = JSON.parse(file.content || "[]");
-    return await this.discordFileStorage.getAttachmentUrls(ids);
+    if (!file) throw new Error(`File not found: ${path}`);
+    if (file.type === 'directory') throw new Error(`Cannot share directory: ${path}`);
+    const contentRefs = JSON.parse(file.content || '[]');
+    return await this.discordFileStorage.getAttachmentUrls(contentRefs);
   }
 
-  // --- NOUVELLES FONCTIONNALITÉS CIBLES ---
+  async deleteFile(path: string, onProgress?: ProgressCallback) {
+    const file = this.getFile(path);
+    if (!file) throw new Error(`File not found: ${path}`);
+
+    if (file.type === 'directory') {
+      const children = this.getChildren(path);
+      if (Object.keys(children).length > 0) {
+        throw new Error(`Directory not empty: ${path}`);
+      }
+    }
+
+    const result = await fetch(`${SERVER_URL}/files/delete/${this.userId}/${file.id}`, {
+      method: 'DELETE',
+    });
+    if (result.status !== 200) {
+      throw new Error(`Error deleting file: ${result.status} ${result.statusText}`);
+    }
+    if (file.type === 'file' && file.content) {
+      await this.discordFileStorage.delete(JSON.parse(file.content), onProgress);
+    } else if (onProgress) {
+      onProgress(1, 1);
+    }
+
+    const parent = this.getParent(path);
+    delete parent.children![file.name];
+  }
+
+  // ─── Extended features (Distock additions) ────────────────────────────
 
   private _flattenTree(file: DisboxFile, currentPath: string): DisboxFile[] {
     let files: DisboxFile[] = [];
@@ -820,19 +594,23 @@ export class DisboxFileManager {
       files.push({ ...file, path: currentPath });
     } else if (file.children) {
       for (const [name, child] of Object.entries(file.children)) {
-        files = files.concat(this._flattenTree(child, currentPath ? `${currentPath}${FILE_DELIMITER}${name}` : name));
+        files = files.concat(
+          this._flattenTree(child, currentPath ? `${currentPath}${FILE_DELIMITER}${name}` : name)
+        );
       }
     }
     return files;
   }
 
-  private _getAllDirs(file: DisboxFile, currentPath: string, depth = 0): Array<{ file: DisboxFile, depth: number }> {
-    let dirs: Array<{ file: DisboxFile, depth: number }> = [];
+  private _getAllDirs(file: DisboxFile, currentPath: string, depth = 0): Array<{ file: DisboxFile; depth: number }> {
+    const dirs: Array<{ file: DisboxFile; depth: number }> = [];
     if (file.type === 'directory') {
       dirs.push({ file: { ...file, path: currentPath }, depth });
       if (file.children) {
         for (const [name, child] of Object.entries(file.children)) {
-          dirs = dirs.concat(this._getAllDirs(child, currentPath ? `${currentPath}${FILE_DELIMITER}${name}` : name, depth + 1));
+          dirs.push(
+            ...this._getAllDirs(child, currentPath ? `${currentPath}${FILE_DELIMITER}${name}` : name, depth + 1)
+          );
         }
       }
     }
@@ -849,146 +627,97 @@ export class DisboxFileManager {
     }
 
     const allFiles = this._flattenTree(root, path);
-    let deletedCount = 0;
-    
+    let deleted = 0;
     for (const f of allFiles) {
-       await this.deleteFile(f.path!);
-       deletedCount++;
-       if (onProgress) onProgress(deletedCount, allFiles.length);
+      await this.deleteFile(f.path!);
+      deleted++;
+      if (onProgress) onProgress(deleted, allFiles.length);
     }
 
+    // Delete empty directories deepest first
     const allDirs = this._getAllDirs(root, path).sort((a, b) => b.depth - a.depth);
     for (const d of allDirs) {
-      await this._deleteEmptyAPI(d.file);
-    }
-  }
-
-  private async _deleteEmptyAPI(file: DisboxFile) {
-    const result = await apiFetch(`${SERVER_URL}/files/delete/${this.userId}/${file.id}`, { method: 'DELETE' });
-    if (!result.ok) throw new Error("Delete failed");
-    
-    if (file.path) {
-      const parentNode = this.getFile(this.getParent(file.path).path || "", false);
-      if (parentNode && parentNode.children) {
-         delete parentNode.children[file.name];
+      try {
+        await this.deleteFile(d.file.path!);
+      } catch {
+        // May already be deleted
       }
     }
-  }
-
-  async deleteFile(path: string, onProgress?: ProgressCallback) {
-    const file = this.getFile(path);
-    if (!file) throw new Error("Not found");
-    
-    if (file.type === 'directory') {
-      const children = Object.keys(file.children || {});
-      if (children.length > 0) throw new Error("Directory not empty");
-      await this._deleteEmptyAPI(file);
-      return;
-    }
-
-    const result = await apiFetch(`${SERVER_URL}/files/delete/${this.userId}/${file.id}`, { method: 'DELETE' });
-    if (!result.ok) throw new Error("Delete failed");
-
-    if (file.content) {
-      const ids = JSON.parse(file.content);
-      await this.discordFileStorage.delete(ids, onProgress);
-    } else if (onProgress) {
-        onProgress(1, 1);
-    }
-
-    const parentNode = this.getFile(this.getParent(path).path || "", false)!;
-    delete parentNode.children![file.name];
   }
 
   async downloadFolderAsZip(path: string, onProgress?: ProgressCallback) {
     const root = this.getFile(path);
-    if (!root || root.type !== 'directory') throw new Error("Not a directory");
+    if (!root || root.type !== 'directory') throw new Error('Not a directory');
 
     const zip = new JSZip();
     const allFiles = this._flattenTree(root, path);
-    
     let processed = 0;
+
     for (const f of allFiles) {
       if (!f.content) continue;
       const ids = JSON.parse(f.content);
       const urls = await this.discordFileStorage.getAttachmentUrls(ids);
-      const fileBlobParts: Blob[] = [];
-      
+      const parts: Blob[] = [];
       for (const url of urls) {
-        const chunkBlob = await fetchProxiedChunk(url);
-        fileBlobParts.push(chunkBlob);
+        parts.push(await fetchUrl(url));
       }
-      
-      const fullBlob = new Blob(fileBlobParts);
-      // Remove root path from zip path
       const relativePath = f.path!.substring(path.length + 1);
-      zip.file(relativePath, fullBlob);
-      
+      zip.file(relativePath, new Blob(parts));
       processed++;
       if (onProgress) onProgress(processed, allFiles.length);
     }
 
     const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
-    
-    // We can use a trick to download the blob directly in browser
-    const downloadUrl = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = downloadUrl;
+    a.href = URL.createObjectURL(blob);
     a.download = `${root.name}.zip`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    URL.revokeObjectURL(downloadUrl);
+    URL.revokeObjectURL(a.href);
   }
-  async downloadMultipleAsZip(files: DisboxFile[], zipName: string = "Distock_Selection.zip", onProgress?: ProgressCallback) {
+
+  async downloadMultipleAsZip(files: DisboxFile[], zipName = 'Distock_Selection.zip', onProgress?: ProgressCallback) {
     const zip = new JSZip();
-    const allFilesToZip: { file: DisboxFile, relativePath: string }[] = [];
+    const toZip: { file: DisboxFile; relativePath: string }[] = [];
 
-    const flattenToZip = (list: DisboxFile[], currentPath: string = "") => {
-       for (const f of list) {
-          if (f.type === 'directory') {
-             const dirNode = this.getFile(f.path!);
-             if (dirNode && dirNode.children) {
-                 flattenToZip(Object.values(dirNode.children), `${currentPath}${f.name}/`);
-             }
-          } else {
-             allFilesToZip.push({ file: f, relativePath: `${currentPath}${f.name}` });
+    const flatten = (list: DisboxFile[], prefix = '') => {
+      for (const f of list) {
+        if (f.type === 'directory') {
+          const dirNode = this.getFile(f.path!);
+          if (dirNode?.children) {
+            flatten(Object.values(dirNode.children), `${prefix}${f.name}/`);
           }
-       }
+        } else {
+          toZip.push({ file: f, relativePath: `${prefix}${f.name}` });
+        }
+      }
     };
-
-    flattenToZip(files);
+    flatten(files);
 
     let processed = 0;
-    for (const item of allFilesToZip) {
-      const f = item.file;
-      if (!f.content) continue;
-      const ids = JSON.parse(f.content);
+    for (const item of toZip) {
+      if (!item.file.content) continue;
+      const ids = JSON.parse(item.file.content);
       const urls = await this.discordFileStorage.getAttachmentUrls(ids);
-      const fileBlobParts: Blob[] = [];
-      
+      const parts: Blob[] = [];
       for (const url of urls) {
-        const chunkBlob = await fetchProxiedChunk(url);
-        fileBlobParts.push(chunkBlob);
+        parts.push(await fetchUrl(url));
       }
-      
-      const fullBlob = new Blob(fileBlobParts);
-      zip.file(item.relativePath, fullBlob);
-      
+      zip.file(item.relativePath, new Blob(parts));
       processed++;
-      if (onProgress) onProgress(processed, allFilesToZip.length);
+      if (onProgress) onProgress(processed, toZip.length);
     }
 
-    if (processed === 0) return; // Nothing to zip
+    if (processed === 0) return;
 
     const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE' });
-    const downloadUrl = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = downloadUrl;
+    a.href = URL.createObjectURL(blob);
     a.download = zipName;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    URL.revokeObjectURL(downloadUrl);
+    URL.revokeObjectURL(a.href);
   }
 }

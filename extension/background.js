@@ -1,77 +1,41 @@
-// Background Service Worker — Distock Extension
-// Gère l'état de l'extension et le PROXY d'upload vers Discord (bypass CORS)
+// Distock Extension — Background Service Worker
+// Handles download proxying from Discord CDN (bypasses CORS)
+// Uploads go DIRECTLY from the page to Discord webhooks (no proxy needed)
 
 chrome.runtime.onInstalled.addListener(() => {
-  console.log('[Distock] Extension installée. Proxy upload Discord actif.');
-  chrome.storage.local.set({ enabled: true, installDate: Date.now() });
+  console.log('[Distock Extension] Installed. Download proxy active.');
 });
 
-// ─── Upload Proxy Handler ─────────────────────────────────────────────
-// Reçoit les chunks depuis le content script et les uploade directement
-// vers Discord via fetch (pas de CORS dans le contexte service worker).
-
-async function handleUploadChunk(message) {
-  const { webhookUrl, chunkData, chunkName } = message;
-  
-  try {
-    const blob = new Blob([chunkData]);
-    const formData = new FormData();
-    formData.append('payload_json', JSON.stringify({}));
-    formData.append('file', blob, chunkName);
-    
-    const response = await fetch(webhookUrl + '?wait=true', {
-      method: 'POST',
-      body: formData
-    });
-    
-    if (response.status === 429) {
-      const retryAfter = Number(response.headers.get('Retry-After') || 2);
-      return { rateLimited: true, retryAfter };
-    }
-    
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => '');
-      return { error: `Discord ${response.status}: ${errorText}` };
-    }
-    
-    const data = await response.json();
-    return { success: true, data };
-  } catch (err) {
-    return { error: err.message || 'Unknown upload error in extension' };
-  }
+function blobToBase64(blob) {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result);
+    reader.readAsDataURL(blob);
+  });
 }
 
-// ─── Message Router ────────────────────────────────────────────────────
-
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type === 'DISTOCK_PING') {
-    sendResponse({ type: 'DISTOCK_PONG', version: chrome.runtime.getManifest().version });
+// Handle messages from the content script
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.type === 'DISTOCK_PING') {
+    sendResponse({ version: chrome.runtime.getManifest().version });
     return true;
   }
 
-  if (message.type === 'DISTOCK_GET_STATUS') {
-    chrome.storage.local.get(['enabled'], (result) => {
-      sendResponse({ enabled: result.enabled !== false });
-    });
-    return true;
-  }
+  if (request.type === 'DISTOCK_FETCH_URL') {
+    const url = request.url;
+    console.log(`[Distock Extension] Proxying download: ${url.substring(0, 80)}...`);
 
-  if (message.type === 'DISTOCK_SET_ENABLED') {
-    chrome.storage.local.set({ enabled: message.enabled }, () => {
-      sendResponse({ ok: true });
-    });
-    return true;
-  }
+    fetch(url)
+      .then(response => response.blob())
+      .then(blob => blobToBase64(blob))
+      .then(base64 => {
+        sendResponse({ data: base64 });
+      })
+      .catch(error => {
+        console.error('[Distock Extension] Download proxy error:', error);
+        sendResponse({ data: null, error: error.message });
+      });
 
-  if (message.type === 'DISTOCK_UPLOAD_CHUNK') {
-    handleUploadChunk(message)
-      .then(result => sendResponse(result))
-      .catch(err => sendResponse({ error: err.message }));
     return true; // Keep message channel open for async response
   }
-});
-
-// Ouvrir Distock si l'utilisateur clique sur l'icône sans popup sur une page non-Distock
-chrome.action.onClicked.addListener(() => {
-  // Géré par le popup par défaut
 });
