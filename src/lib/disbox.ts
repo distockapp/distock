@@ -220,8 +220,14 @@ class DiscordWebhookClient {
     this.rateLimitWaits[type] = remaining === 0 ? resetAfter * 1000 : 0;
 
     if (response.status === 429) {
-      const data = await response.json();
-      const retryAfter = data.retry_after || 5; // Fallback just in case
+      let retryAfter = 5; // Default 5 seconds
+      try {
+         const data = await response.json();
+         retryAfter = data.retry_after || 5;
+      } catch (parseErr) {
+         console.warn(`[Distock][${this.label}] 429 returned non-JSON (Cloudflare block?). Defauling to 10s backoff.`);
+         retryAfter = 10;
+      }
       this.rateLimitWaits[type] = retryAfter * 1000;
       console.warn(`[Distock][${this.label}] 429 rate limited — retrying after ${retryAfter}s`);
       return await this.fetchFromApi(path, { type, method, body });
@@ -336,14 +342,20 @@ class DiscordFileStorage {
 
       for (const client of clientsToTest) {
         try {
+          // Add a 450ms delay between consecutive GET requests.
+          // Discord limits requests to 5 per 2 seconds (400ms per request).
+          // Without this delay, scanning a 19-chunk file creates a rapid GET spike
+          // that immediately gets Cloudflare IP-banned!
+          await sleep(450);
+          
           const msg = await client.getMessage(actualId);
           if (msg?.attachments?.[0]?.url) {
             urls.push(msg.attachments[0].url);
             found = true;
             break;
           }
-        } catch {
-          // Try next client
+        } catch (err: any) {
+          console.warn(`[Distock] Failed to get chunk ${actualId} from webhook: ${err.message}`);
         }
       }
       if (!found) {
@@ -514,6 +526,9 @@ class DiscordFileStorage {
 
       for (const client of clientsToTest) {
         try {
+          // Strict delay to avoid rapid bulk delete 429 IP ban
+          await sleep(450);
+          
           await client.deleteMessage(actualId);
           break;
         } catch (err) {
