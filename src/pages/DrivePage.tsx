@@ -1,7 +1,7 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import { useDriveStore } from '../store/useDriveStore';
 import { FileTable } from '../components/FileTable';
-import { Search, Upload, FolderPlus, LogOut, ArrowLeft, RefreshCw, ServerCrash, Cloud } from 'lucide-react';
+import { Search, Upload, FolderPlus, LogOut, ArrowLeft, RefreshCw, ServerCrash, Cloud, XCircle } from 'lucide-react';
 import { useDropzone } from 'react-dropzone';
 import { toast } from 'sonner';
 import { formatSize } from '../lib/utils';
@@ -10,22 +10,44 @@ export function DrivePage() {
   const { fileManager, currentPath, setCurrentPath, setWebhookUrl, webhookUrl, initManager, searchQuery, setSearchQuery, refreshFiles, totalSize } = useDriveStore();
   const [isUploading, setIsUploading] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [uploadSpeed, setUploadSpeed] = useState('');
+  const [uploadETA, setUploadETA] = useState('');
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   const [showNewFolderDialog, setShowNewFolderDialog] = useState(false);
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
 
+  const handleCancelUpload = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+      toast.info("Upload annulé. Progression sauvegardée pour reprise.");
+    }
+  };
+
   const onDrop = useCallback(async (acceptedFiles: File[]) => {
     if (!fileManager) return;
+    
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    
     setIsUploading(true);
     setProgress(0);
+    setUploadSpeed('');
+    setUploadETA('');
     let errorCount = 0;
     
     // Total sizes for global progress estimation
     const totalSize = acceptedFiles.reduce((acc, f) => acc + f.size, 0);
     let uploadedSize = 0;
 
+    let lastProgressTime = Date.now();
+    let lastProgressBytes = 0;
+
     for (const file of acceptedFiles) {
+      if (controller.signal.aborted) break;
+      
       try {
         // webkitRelativePath allows folder uploads. E.g "myFolder/sub/file.txt"
         const relativePath = file.webkitRelativePath || file.name;
@@ -47,22 +69,49 @@ export function DrivePage() {
         const exactPath = builtPath ? `${builtPath}/${fileName}` : fileName;
 
         await fileManager.uploadFile(exactPath, file, (uploadedBytes, _totalBytes) => {
-           setProgress(((uploadedSize + uploadedBytes) / totalSize) * 100);
-        });
+           const currentTotal = uploadedSize + uploadedBytes;
+           setProgress((currentTotal / totalSize) * 100);
+           
+           // Calculate speed every 2 seconds
+           const now = Date.now();
+           if (now - lastProgressTime > 2000) {
+             const deltaBytes = currentTotal - lastProgressBytes;
+             const deltaSec = (now - lastProgressTime) / 1000;
+             const bytesPerSec = deltaBytes / deltaSec;
+             setUploadSpeed(bytesPerSec > 0 ? `${formatSize(bytesPerSec)}/s` : '');
+             
+             // ETA
+             const remaining = totalSize - currentTotal;
+             if (bytesPerSec > 0) {
+               const etaSec = remaining / bytesPerSec;
+               if (etaSec < 60) setUploadETA(`~${Math.ceil(etaSec)}s`);
+               else if (etaSec < 3600) setUploadETA(`~${Math.ceil(etaSec / 60)}min`);
+               else setUploadETA(`~${(etaSec / 3600).toFixed(1)}h`);
+             }
+             lastProgressTime = now;
+             lastProgressBytes = currentTotal;
+           }
+        }, controller.signal);
         uploadedSize += file.size;
         setProgress((uploadedSize / totalSize) * 100);
 
       } catch (err) {
         console.error(err);
         errorCount++;
-        toast.error(`Échec upload: ${file.name} - ${err instanceof Error ? err.message : String(err)}`);
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!msg.includes('annulé')) {
+          toast.error(`Échec upload: ${file.name} - ${msg}`);
+        }
       }
     }
     
     refreshFiles();
     setIsUploading(false);
     setProgress(0);
-    if (errorCount === 0) toast.success(`${acceptedFiles.length} fichier(s) uploadé(s)`);
+    setUploadSpeed('');
+    setUploadETA('');
+    abortControllerRef.current = null;
+    if (errorCount === 0 && !controller.signal.aborted) toast.success(`${acceptedFiles.length} fichier(s) uploadé(s)`);
   }, [fileManager, currentPath, refreshFiles]);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({ onDrop, noClick: true });
@@ -219,12 +268,24 @@ export function DrivePage() {
       </div>
 
       {isUploading && (
-         <div className="px-4 py-2 bg-discord/20 border-b border-discord/30 text-sm flex items-center gap-4">
-            <span className="flex items-center gap-2 font-medium"><div className="w-4 h-4 rounded-full border-2 border-t-transparent border-white animate-spin"></div> Upload en cours...</span>
-            <div className="flex-1 bg-black/50 h-2 rounded-full overflow-hidden">
-               <div className="h-full bg-discord transition-all duration-300" style={{ width: `${progress}%`}}></div>
+         <div className="px-4 py-2.5 bg-discord/20 border-b border-discord/30 text-sm flex items-center gap-4">
+            <span className="flex items-center gap-2 font-medium shrink-0">
+              <div className="w-4 h-4 rounded-full border-2 border-t-transparent border-white animate-spin"></div>
+              Upload en cours...
+            </span>
+            <div className="flex-1 bg-black/50 h-2.5 rounded-full overflow-hidden">
+               <div className="h-full bg-discord transition-all duration-300 rounded-full" style={{ width: `${progress}%`}}></div>
             </div>
-            <span>{progress.toFixed(0)}%</span>
+            <span className="font-mono tabular-nums shrink-0">{progress.toFixed(1)}%</span>
+            {uploadSpeed && <span className="text-xs text-textSecondary shrink-0 hidden sm:inline">{uploadSpeed}</span>}
+            {uploadETA && <span className="text-xs text-textSecondary shrink-0 hidden sm:inline">{uploadETA}</span>}
+            <button 
+              onClick={handleCancelUpload} 
+              className="p-1.5 rounded-lg hover:bg-red-500/20 text-red-400 hover:text-red-300 transition-colors shrink-0"
+              title="Annuler l'upload"
+            >
+              <XCircle className="w-5 h-5" />
+            </button>
          </div>
       )}
 
