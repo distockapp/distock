@@ -165,6 +165,7 @@ class DiscordWebhookClient {
   private baseUrl: string;
   private rateLimitWaits: Record<string, number> = {};
   readonly label: string;
+  readonly webhookUrl: string;
 
   constructor(webhookUrl: string) {
     // Parse webhook URL to extract ID and token
@@ -172,6 +173,7 @@ class DiscordWebhookClient {
     const token = webhookUrl.split('/').pop();
     // Use discord.com — discordapp.com is deprecated and causes CORS redirect failures on POST requests
     this.baseUrl = `https://discord.com/api/webhooks/${id}/${token}`;
+    this.webhookUrl = this.baseUrl;
     this.label = `WH-${id?.slice(-4) || '????'}`;
   }
 
@@ -371,7 +373,8 @@ class DiscordFileStorage {
         if (!result || !result.id) {
           throw new Error(`Result is irrevocably undefined after loop!`);
         }
-        messageIdMap[item.index] = result.id;
+        // Pin the chunk mathematically to its owner webhook forever
+        messageIdMap[item.index] = `${item.client.webhookUrl}|${result.id}`;
         uploadedBytes += item.chunk.byteLength;
         if (onProgress) onProgress(uploadedBytes, sourceFile.size);
       }));
@@ -412,17 +415,28 @@ class DiscordFileStorage {
     for (let i = 0; i < messageIds.length; i++) {
       const id = messageIds[i];
       let chunkUrl: string | null = null;
+      let actualId = id;
+      let targetClient: DiscordWebhookClient | null = null;
 
-      // Smart Guess: we know which client uploaded this chunk based on modulo
-      const guessClientIndex = i % this.webhookClients.length;
-      const clientsToTest = [
-        this.webhookClients[guessClientIndex],
-        ...this.webhookClients.filter((_, idx) => idx !== guessClientIndex)
-      ];
+      // Extract pinned Webhook if it exists
+      if (id.includes('|')) {
+        const parts = id.split('|');
+        targetClient = new DiscordWebhookClient(parts[0]);
+        actualId = parts[1];
+      }
+
+      // If pinned, we only test the exact webhook that uploaded it
+      // Otherwise, Smart Guess based on modulo (legacy fallback)
+      const clientsToTest = targetClient 
+        ? [targetClient]
+        : [
+            this.webhookClients[i % this.webhookClients.length],
+            ...this.webhookClients.filter((_, idx) => idx !== (i % this.webhookClients.length))
+          ];
 
       for (const client of clientsToTest) {
         try {
-          const msg = await client.getMessage(id);
+          const msg = await client.getMessage(actualId);
           if (msg?.attachments?.[0]?.url) {
             chunkUrl = msg.attachments[0].url;
             break;
@@ -433,7 +447,7 @@ class DiscordFileStorage {
       }
 
       if (!chunkUrl) {
-         throw new Error(`[Distock] Fatal: Failed to find attachment URL for chunk ${i} (ID: ${id}) across all configured webhooks.`);
+         throw new Error(`[Distock] Fatal: Failed to find attachment URL for chunk ${i} (ID: ${actualId}) across all configured webhooks.`);
       }
 
       // We have the URL, download it directly
