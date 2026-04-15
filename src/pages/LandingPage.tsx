@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import type { FormEvent } from 'react';
 import { useDriveStore } from '../store/useDriveStore';
 import { Shield, Zap, Cloud, Info, X } from 'lucide-react';
@@ -6,9 +6,26 @@ import { useNavigate } from 'react-router-dom';
 
 export function LandingPage() {
   const [webhooks, setWebhooks] = useState<string[]>(['']);
+  const [rememberMe, setRememberMe] = useState(false);
   const [showMultiHookTutorial, setShowMultiHookTutorial] = useState(false);
   const setWebhookUrl = useDriveStore(s => s.setWebhookUrl);
   const navigate = useNavigate();
+
+  useEffect(() => {
+    const savedWebhooks = localStorage.getItem('distock_webhooks');
+    const savedRememberMe = localStorage.getItem('distock_remember_me');
+    if (savedWebhooks && savedRememberMe === 'true') {
+      try {
+        const parsed = JSON.parse(savedWebhooks);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setWebhooks(parsed);
+          setRememberMe(true);
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
+  }, []);
 
   const handleSetup = (e: FormEvent) => {
     e.preventDefault();
@@ -23,6 +40,15 @@ export function LandingPage() {
         return;
       }
     }
+
+    if (rememberMe) {
+      localStorage.setItem('distock_webhooks', JSON.stringify(rawUrls));
+      localStorage.setItem('distock_remember_me', 'true');
+    } else {
+      localStorage.removeItem('distock_webhooks');
+      localStorage.removeItem('distock_remember_me');
+    }
+
     setWebhookUrl(rawUrls.join(','));
     navigate('/drive');
   };
@@ -102,6 +128,19 @@ export function LandingPage() {
             <button type="button" onClick={addWebhookField} className="w-full border border-dashed border-white/20 hover:border-discord hover:text-discord text-white/50 text-sm font-medium py-3 rounded-lg transition-all">
               + Ajouter un Webhook (Multiplie la Vitesse)
             </button>
+          </div>
+
+          <div className="flex items-center gap-2 mb-6 ml-1">
+            <input 
+               type="checkbox" 
+               id="rememberMe" 
+               checked={rememberMe} 
+               onChange={(e) => setRememberMe(e.target.checked)}
+               className="w-4 h-4 rounded border-white/20 bg-background accent-discord focus:ring-discord focus:ring-offset-background cursor-pointer"
+            />
+            <label htmlFor="rememberMe" className="text-sm text-textSecondary cursor-pointer hover:text-white transition-colors select-none">
+               Se souvenir de mes Webhooks
+            </label>
           </div>
 
           <button type="submit" disabled={!webhooks.some(h => h.trim())} className="w-full bg-discord hover:bg-discord/80 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold py-3 rounded-lg transition-colors">
