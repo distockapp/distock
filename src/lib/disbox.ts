@@ -406,8 +406,45 @@ class DiscordFileStorage {
     onProgress: ProgressCallback | null = null,
     fileSize = -1
   ): Promise<void> {
-    const urls = await this.getAttachmentUrls(messageIds);
-    await downloadFromAttachmentUrls(urls, writeStream, onProgress, fileSize);
+    let bytesDownloaded = 0;
+    if (onProgress) onProgress(0, fileSize);
+
+    for (let i = 0; i < messageIds.length; i++) {
+      const id = messageIds[i];
+      let chunkUrl: string | null = null;
+
+      // Smart Guess: we know which client uploaded this chunk based on modulo
+      const guessClientIndex = i % this.webhookClients.length;
+      const clientsToTest = [
+        this.webhookClients[guessClientIndex],
+        ...this.webhookClients.filter((_, idx) => idx !== guessClientIndex)
+      ];
+
+      for (const client of clientsToTest) {
+        try {
+          const msg = await client.getMessage(id);
+          if (msg?.attachments?.[0]?.url) {
+            chunkUrl = msg.attachments[0].url;
+            break;
+          }
+        } catch {
+          // If 404 or rate-limited, maybe the storage structure changed. Try next client.
+        }
+      }
+
+      if (!chunkUrl) {
+         throw new Error(`[Distock] Fatal: Failed to find attachment URL for chunk ${i} (ID: ${id}) across all configured webhooks.`);
+      }
+
+      // We have the URL, download it directly
+      const blob = await fetchUrl(chunkUrl);
+      await writeStream.write(blob);
+      bytesDownloaded += blob.size;
+      
+      if (onProgress) onProgress(bytesDownloaded, Math.max(fileSize, bytesDownloaded));
+    }
+    
+    await writeStream.close();
   }
 
   async delete(messageIds: string[], onProgress?: ProgressCallback) {
