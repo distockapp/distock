@@ -325,6 +325,7 @@ class DiscordFileStorage {
     namePrefix: string,
     onProgress: ProgressCallback | null = null
   ): Promise<string[]> {
+    const totalChunks = Math.ceil(sourceFile.size / CHUNK_SIZE);
     const messageIdMap: string[] = new Array(totalChunks).fill("");
     let uploadedBytes = 0;
     let index = 0;
