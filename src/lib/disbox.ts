@@ -446,18 +446,30 @@ export class DisboxFileManager {
     const url = new URL(webhookUrl);
     const fileTrees: Record<string, any> = {};
 
-    // Handle Discord changing webhook URLs (discord.com vs discordapp.com)
-    for (const hostname of ['discord.com', 'discordapp.com']) {
-      url.hostname = hostname;
+    // Execute requests in parallel to drastically reduce cold start server delays
+    const fetchPromises = ['discord.com', 'discordapp.com'].map(async (hostname) => {
+      const testUrl = new URL(webhookUrl);
+      testUrl.hostname = hostname;
       try {
-        const result = await fetch(`${SERVER_URL}/files/get/${sha256(url.href)}`);
+        // Build a 25-second timeout controller in case the Fly.io server stalls
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 25000);
+        
+        const result = await fetch(`${SERVER_URL}/files/get/${sha256(testUrl.href)}`, {
+           signal: controller.signal
+        });
+        
+        clearTimeout(timeoutId);
+        
         if (result.status === 200) {
-          fileTrees[url.href] = await result.json();
+          fileTrees[testUrl.href] = await result.json();
         }
       } catch (e) {
         console.warn(`[Distock] Failed to fetch tree for ${hostname}:`, e);
       }
-    }
+    });
+
+    await Promise.all(fetchPromises);
 
     if (Object.keys(fileTrees).length === 0) {
       throw new Error('Failed to get files for user.');
