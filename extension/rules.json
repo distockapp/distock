@@ -5,31 +5,14 @@
     "action": {
       "type": "modifyHeaders",
       "responseHeaders": [
-        {
-          "header": "Access-Control-Allow-Origin",
-          "operation": "set",
-          "value": "*"
-        },
-        {
-          "header": "Access-Control-Allow-Methods",
-          "operation": "set",
-          "value": "GET, HEAD, OPTIONS"
-        },
-        {
-          "header": "Access-Control-Allow-Headers",
-          "operation": "set",
-          "value": "*"
-        },
-        {
-          "header": "Access-Control-Expose-Headers",
-          "operation": "set",
-          "value": "Content-Length, Content-Type"
-        }
+        { "header": "Access-Control-Allow-Origin", "operation": "set", "value": "*" },
+        { "header": "Access-Control-Allow-Headers", "operation": "set", "value": "*" },
+        { "header": "Access-Control-Expose-Headers", "operation": "set", "value": "*" }
       ]
     },
     "condition": {
-      "urlFilter": "||cdn.discordapp.com/*",
-      "resourceTypes": ["xmlhttprequest", "other"]
+      "urlFilter": "||discord.com/api/webhooks/*",
+      "resourceTypes": ["xmlhttprequest"]
     }
   },
   {
@@ -38,82 +21,14 @@
     "action": {
       "type": "modifyHeaders",
       "responseHeaders": [
-        {
-          "header": "Access-Control-Allow-Origin",
-          "operation": "set",
-          "value": "*"
-        },
-        {
-          "header": "Access-Control-Allow-Methods",
-          "operation": "set",
-          "value": "GET, HEAD, OPTIONS"
-        },
-        {
-          "header": "Access-Control-Allow-Headers",
-          "operation": "set",
-          "value": "*"
-        }
-      ]
-    },
-    "condition": {
-      "urlFilter": "||media.discordapp.net/*",
-      "resourceTypes": ["xmlhttprequest", "other"]
-    }
-  },
-  {
-    "id": 3,
-    "priority": 2,
-    "action": {
-      "type": "modifyHeaders",
-      "responseHeaders": [
-        {
-          "header": "Access-Control-Allow-Origin",
-          "operation": "set",
-          "value": "*"
-        },
-        {
-          "header": "Access-Control-Allow-Methods",
-          "operation": "set",
-          "value": "GET, POST, OPTIONS"
-        },
-        {
-          "header": "Access-Control-Allow-Headers",
-          "operation": "set",
-          "value": "*"
-        }
+        { "header": "Access-Control-Allow-Origin", "operation": "set", "value": "*" },
+        { "header": "Access-Control-Allow-Headers", "operation": "set", "value": "*" },
+        { "header": "Access-Control-Expose-Headers", "operation": "set", "value": "*" }
       ]
     },
     "condition": {
       "urlFilter": "||discordapp.com/api/webhooks/*",
-      "resourceTypes": ["xmlhttprequest", "other"]
-    }
-  },
-  {
-    "id": 4,
-    "priority": 2,
-    "action": {
-      "type": "modifyHeaders",
-      "responseHeaders": [
-        {
-          "header": "Access-Control-Allow-Origin",
-          "operation": "set",
-          "value": "*"
-        },
-        {
-          "header": "Access-Control-Allow-Methods",
-          "operation": "set",
-          "value": "GET, POST, OPTIONS"
-        },
-        {
-          "header": "Access-Control-Allow-Headers",
-          "operation": "set",
-          "value": "*"
-        }
-      ]
-    },
-    "condition": {
-      "urlFilter": "||discord.com/api/webhooks/*",
-      "resourceTypes": ["xmlhttprequest", "other"]
+      "resourceTypes": ["xmlhttprequest"]
     }
   }
 ]
