@@ -3,11 +3,8 @@
 // Handles ONLY download proxying — uploads go direct to Discord
 
 (function() {
-  // Inject extension detection flag into the page's main world
-  const script = document.createElement('script');
-  script.textContent = `window.__DISTOCK_EXTENSION__ = true;`;
-  (document.head || document.documentElement).appendChild(script);
-  script.remove();
+  // Inject extension detection flag safely (CSP-compliant)
+  document.documentElement.dataset.distockExtension = 'true';
 
   // Listen for download proxy requests from the page
   window.addEventListener('message', (event) => {

@@ -1,2 +1,2 @@
 // Global constants
-export const CHUNK_SIZE = 25 * 1024 * 1023; // ~24.97 MB — identical to original Disbox
+export const CHUNK_SIZE = 8 * 1024 * 1024; // 8MB - Safest limit for free Discord webhooks

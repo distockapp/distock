@@ -58,34 +58,40 @@ async function* readFile(file: File, chunkSize: number) {
  */
 async function fetchUrlFromExtension(url: string): Promise<string | null> {
   // Try to communicate with the extension via the content script bridge
-  if (typeof window !== 'undefined' && (window as any).__DISTOCK_EXTENSION__) {
-    return new Promise((resolve) => {
-      const timeout = setTimeout(() => {
-        window.removeEventListener('message', handler);
-        resolve(null);
-      }, 15000);
+  if (typeof document !== 'undefined' && document.documentElement.dataset.distockExtension) {
+    try {
+      const response = await new Promise<string | null>((resolve) => {
+        const timeout = setTimeout(() => {
+          window.removeEventListener('message', handler);
+          resolve(null);
+        }, 15000);
 
-      const reqId = `dl_${Date.now()}_${Math.random().toString(36).slice(2)}`;
-      
-      const handler = (event: MessageEvent) => {
-        if (event.source !== window) return;
-        if (event.data?.source !== 'DISTOCK_EXTENSION') return;
-        if (event.data?.type !== 'FETCH_RESULT') return;
-        if (event.data?.requestId !== reqId) return;
+        const reqId = `dl_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+        
+        const handler = (event: MessageEvent) => {
+          if (event.source !== window) return;
+          if (event.data?.source !== 'DISTOCK_EXTENSION') return;
+          if (event.data?.type !== 'FETCH_RESULT') return;
+          if (event.data?.requestId !== reqId) return;
 
-        clearTimeout(timeout);
-        window.removeEventListener('message', handler);
-        resolve(event.data.data || null);
-      };
+          clearTimeout(timeout);
+          window.removeEventListener('message', handler);
+          resolve(event.data.data || null);
+        };
 
-      window.addEventListener('message', handler);
-      window.postMessage({
-        source: 'DISTOCK_PAGE',
-        type: 'FETCH_URL',
-        requestId: reqId,
-        url
-      }, '*');
-    });
+        window.addEventListener('message', handler);
+        window.postMessage({
+          source: 'DISTOCK_PAGE',
+          type: 'FETCH_URL',
+          requestId: reqId,
+          url
+        }, '*');
+      });
+      return response;
+    } catch(e) {
+      console.error("Extension fetch failed", e);
+      return null;
+    }
   }
   return null;
 }
