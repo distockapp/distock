@@ -321,11 +321,22 @@ class DiscordFileStorage {
 
   async getAttachmentUrls(messageIds: string[]): Promise<string[]> {
     const urls: string[] = [];
-    for (const id of messageIds) {
+    for (const rawId of messageIds) {
       let found = false;
-      for (const client of this.webhookClients) {
+      let actualId = rawId;
+      let targetClient: DiscordWebhookClient | null = null;
+      
+      if (rawId.includes('|')) {
+        const parts = rawId.split('|');
+        targetClient = new DiscordWebhookClient(parts[0]);
+        actualId = parts[1];
+      }
+      
+      const clientsToTest = targetClient ? [targetClient] : this.webhookClients;
+
+      for (const client of clientsToTest) {
         try {
-          const msg = await client.getMessage(id);
+          const msg = await client.getMessage(actualId);
           if (msg?.attachments?.[0]?.url) {
             urls.push(msg.attachments[0].url);
             found = true;
@@ -336,7 +347,7 @@ class DiscordFileStorage {
         }
       }
       if (!found) {
-        console.warn(`[Distock] Message ${id} not found across webhooks`);
+        console.warn(`[Distock] Message ${actualId} not found across webhooks`);
       }
     }
     return urls;
@@ -489,10 +500,21 @@ class DiscordFileStorage {
   async delete(messageIds: string[], onProgress?: ProgressCallback) {
     let deleted = 0;
     if (onProgress) onProgress(0, messageIds.length);
-    for (const id of messageIds) {
-      for (const client of this.webhookClients) {
+    for (const rawId of messageIds) {
+      let actualId = rawId;
+      let targetClient: DiscordWebhookClient | null = null;
+      
+      if (rawId.includes('|')) {
+        const parts = rawId.split('|');
+        targetClient = new DiscordWebhookClient(parts[0]);
+        actualId = parts[1];
+      }
+      
+      const clientsToTest = targetClient ? [targetClient] : this.webhookClients;
+
+      for (const client of clientsToTest) {
         try {
-          await client.deleteMessage(id);
+          await client.deleteMessage(actualId);
           break;
         } catch (err) {
           // Keep trying with other clients
