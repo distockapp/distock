@@ -1,28 +1,6 @@
 [
   {
     "id": 1,
-    "priority": 100,
-    "action": {
-      "type": "allowAllRequests"
-    },
-    "condition": {
-      "urlFilter": "||discord.com/api/webhooks/*",
-      "resourceTypes": ["xmlhttprequest"]
-    }
-  },
-  {
-    "id": 2,
-    "priority": 100,
-    "action": {
-      "type": "allowAllRequests"
-    },
-    "condition": {
-      "urlFilter": "||discordapp.com/api/webhooks/*",
-      "resourceTypes": ["xmlhttprequest"]
-    }
-  },
-  {
-    "id": 3,
     "priority": 1,
     "action": {
       "type": "modifyHeaders",
@@ -38,7 +16,7 @@
     }
   },
   {
-    "id": 4,
+    "id": 2,
     "priority": 1,
     "action": {
       "type": "modifyHeaders",
