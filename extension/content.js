@@ -39,6 +39,10 @@
           filename: event.data.filename,
           base64: event.data.base64
         }, (r) => {
+          if (chrome.runtime.lastError) {
+             window.postMessage({ source: 'DISTOCK_EXTENSION', requestId: event.data.requestId, error: chrome.runtime.lastError.message }, '*');
+             return;
+          }
           window.postMessage({ source: 'DISTOCK_EXTENSION', requestId: event.data.requestId, ...r }, '*');
         });
       } catch (e) {

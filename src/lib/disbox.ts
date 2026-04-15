@@ -225,7 +225,11 @@ class DiscordWebhookClient {
       const response: any = await new Promise((resolve) => {
         const reqId = `up_${Date.now()}_${Math.random().toString(36).slice(2)}`;
         const handler = (event: MessageEvent) => {
-          if (event.source !== window || event.data?.requestId !== reqId) return;
+          if (
+            event.source !== window || 
+            event.data?.requestId !== reqId || 
+            event.data?.source !== 'DISTOCK_EXTENSION'
+          ) return;
           window.removeEventListener('message', handler);
           resolve(event.data);
         };
