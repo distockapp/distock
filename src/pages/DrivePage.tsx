@@ -1,10 +1,11 @@
 import { useState, useCallback, useRef } from 'react';
 import { useDriveStore } from '../store/useDriveStore';
 import { FileTable } from '../components/FileTable';
-import { Search, Upload, FolderPlus, LogOut, ArrowLeft, RefreshCw, ServerCrash, Cloud } from 'lucide-react';
+import { Search, Upload, FolderPlus, LogOut, ArrowLeft, RefreshCw, ServerCrash, Cloud, Pause, Play, X } from 'lucide-react';
 import { useDropzone } from 'react-dropzone';
 import { toast } from 'sonner';
 import { formatSize } from '../lib/utils';
+import { UploadController } from '../lib/disbox';
 
 export function DrivePage() {
   const { fileManager, currentPath, setCurrentPath, setWebhookUrl, webhookUrl, initManager, searchQuery, setSearchQuery, refreshFiles, totalSize } = useDriveStore();
@@ -12,7 +13,9 @@ export function DrivePage() {
   const [progress, setProgress] = useState(0);
   const [uploadSpeed, setUploadSpeed] = useState('');
   const [uploadETA, setUploadETA] = useState('');
+  const [isPaused, setIsPaused] = useState(false);
   const activeUploadRef = useRef(false);
+  const uploadControllerRef = useRef<UploadController | null>(null);
 
   const [showNewFolderDialog, setShowNewFolderDialog] = useState(false);
   const [showLogoutConfirm, setShowLogoutConfirm] = useState(false);
@@ -30,6 +33,8 @@ export function DrivePage() {
     setProgress(0);
     setUploadSpeed('');
     setUploadETA('');
+    setIsPaused(false);
+    uploadControllerRef.current = new UploadController();
     let errorCount = 0;
     
     const totalSize = acceptedFiles.reduce((acc, f) => acc + f.size, 0);
@@ -38,6 +43,7 @@ export function DrivePage() {
     let lastProgressBytes = 0;
 
     for (const file of acceptedFiles) {
+      let exactPath = '';
       try {
         const relativePath = file.webkitRelativePath || file.name;
         
@@ -55,7 +61,7 @@ export function DrivePage() {
           builtPath = dirPath;
         }
 
-        const exactPath = builtPath ? `${builtPath}/${fileName}` : fileName;
+        exactPath = builtPath ? `${builtPath}/${fileName}` : fileName;
 
         await fileManager.uploadFile(exactPath, file, (uploadedBytes, _totalBytes) => {
            const currentTotal = uploadedSize + uploadedBytes;
@@ -79,27 +85,62 @@ export function DrivePage() {
              lastProgressTime = now;
              lastProgressBytes = currentTotal;
            }
-        });
+        }, uploadControllerRef.current!);
         uploadedSize += file.size;
         setProgress((uploadedSize / totalSize) * 100);
 
-      } catch (err) {
-        console.error(err);
-        errorCount++;
-        toast.error(`Échec upload: ${file.name} - ${err instanceof Error ? err.message : String(err)}`);
+      } catch (err: any) {
+        if (err.message === 'UPLOAD_CANCELLED') {
+           try {
+             if (exactPath) {
+               await fileManager.deleteFile(exactPath);
+             }
+           } catch { } // Ignore cleanup errors
+           toast.error(`Upload annulé`);
+           break; // Stop uploading remaining files
+        } else {
+           console.error(err);
+           errorCount++;
+           toast.error(`Échec upload: ${file.name} - ${err instanceof Error ? err.message : String(err)}`);
+        }
       }
     }
     
     refreshFiles();
     activeUploadRef.current = false;
+    const wasCancelled = uploadControllerRef.current?.isCancelled;
+    uploadControllerRef.current = null;
     setIsUploading(false);
     setProgress(0);
     setUploadSpeed('');
     setUploadETA('');
-    if (errorCount === 0) toast.success(`${acceptedFiles.length} fichier(s) uploadé(s)`);
+    setIsPaused(false);
+    if (errorCount === 0 && !wasCancelled) {
+       toast.success(`${acceptedFiles.length} fichier(s) traité(s)`);
+    }
   }, [fileManager, currentPath, refreshFiles]);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({ onDrop, noClick: true });
+
+  const handlePauseResume = () => {
+    const ctrl = uploadControllerRef.current;
+    if (!ctrl) return;
+    if (ctrl.isPaused) {
+      ctrl.resume();
+      setIsPaused(false);
+    } else {
+      ctrl.pause();
+      setIsPaused(true);
+      setUploadSpeed('En pause');
+      setUploadETA('-');
+    }
+  };
+
+  const handleCancel = () => {
+    const ctrl = uploadControllerRef.current;
+    if (!ctrl) return;
+    ctrl.cancel();
+  };
 
   const handleCreateFolder = () => {
     if (!fileManager) return;
@@ -255,15 +296,24 @@ export function DrivePage() {
       {isUploading && (
          <div className="px-4 py-2.5 bg-discord/20 border-b border-discord/30 text-sm flex items-center gap-4">
             <span className="flex items-center gap-2 font-medium shrink-0">
-              <div className="w-4 h-4 rounded-full border-2 border-t-transparent border-white animate-spin"></div>
-              Upload en cours...
+              <div className={`w-4 h-4 rounded-full border-2 border-t-transparent border-white ${isPaused ? 'opacity-50' : 'animate-spin'}`}></div>
+              {isPaused ? 'Upload en pause' : 'Upload en cours...'}
             </span>
             <div className="flex-1 bg-black/50 h-2.5 rounded-full overflow-hidden">
-               <div className="h-full bg-discord transition-all duration-300 rounded-full" style={{ width: `${progress}%`}}></div>
+               <div className={`h-full bg-discord transition-all duration-300 rounded-full ${isPaused ? 'opacity-50' : ''}`} style={{ width: `${progress}%`}}></div>
             </div>
             <span className="font-mono tabular-nums shrink-0">{progress.toFixed(1)}%</span>
             {uploadSpeed && <span className="text-xs text-textSecondary shrink-0 hidden sm:inline">{uploadSpeed}</span>}
             {uploadETA && <span className="text-xs text-textSecondary shrink-0 hidden sm:inline">{uploadETA}</span>}
+            
+            <div className="flex items-center gap-2 ml-2 shrink-0">
+               <button onClick={handlePauseResume} className="p-1.5 bg-white/10 hover:bg-white/20 rounded transition-colors text-white" title={isPaused ? "Reprendre" : "Pause"}>
+                 {isPaused ? <Play className="w-4 h-4" /> : <Pause className="w-4 h-4" />}
+               </button>
+               <button onClick={handleCancel} className="p-1.5 bg-red-500/20 hover:bg-red-500/40 text-red-300 rounded transition-colors" title="Annuler">
+                 <X className="w-4 h-4" />
+               </button>
+            </div>
          </div>
       )}
 

@@ -71,6 +71,38 @@ export function SharePage() {
     let chunksDownloadedBytes = 0;
     
     try {
+      // For single-chunk files, try direct browser download first as a fast path
+      if (fileDetails.urls.length === 1) {
+        try {
+          const chunkBlob = await fetchUrl(fileDetails.urls[0]);
+          const urlObj = URL.createObjectURL(chunkBlob);
+          const a = document.createElement('a');
+          a.href = urlObj;
+          a.download = fileDetails.name;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(urlObj);
+          toast.success("Téléchargement terminé !");
+          return;
+        } catch (fetchErr) {
+          // If fetch fails for single chunk, try opening the URL directly 
+          // (the browser will handle it natively without CORS)
+          console.warn('[Distock] Fetch failed for single chunk, trying direct link...', fetchErr);
+          const a = document.createElement('a');
+          a.href = fileDetails.urls[0];
+          a.download = fileDetails.name;
+          a.target = '_blank';
+          a.rel = 'noopener';
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          toast.success("Téléchargement lancé dans le navigateur !");
+          return;
+        }
+      }
+
+      // Multi-chunk files: need to reassemble
       // @ts-ignore fallback checking if showSaveFilePicker exists
       if (window.showSaveFilePicker) {
         // @ts-ignore
@@ -107,7 +139,7 @@ export function SharePage() {
       }
       toast.success("Téléchargement terminé !");
     } catch (err: any) {
-      if (err.name !== 'AbortError') toast.error(`Erreur: ${err.message}`);
+      if (err.name !== 'AbortError') toast.error(`Erreur de téléchargement: ${err.message}. Essayez d'installer l'extension Distock pour un téléchargement plus fiable.`);
     } finally {
       setIsDownloading(false);
       setProgress(0);
@@ -155,6 +187,33 @@ export function SharePage() {
   const downloadSingleChild = async (f: any) => {
     try {
       toast.info(`Téléchargement de ${f.name}...`);
+      
+      // Single chunk: try direct link as fallback
+      if (f.urls.length === 1) {
+        try {
+          const chunkBlob = await fetchUrl(f.urls[0]);
+          const a = document.createElement('a');
+          const urlObj = URL.createObjectURL(chunkBlob);
+          a.href = urlObj;
+          a.download = f.name;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(urlObj);
+          return;
+        } catch {
+          // Fallback: direct browser link
+          const a = document.createElement('a');
+          a.href = f.urls[0];
+          a.download = f.name;
+          a.target = '_blank';
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          return;
+        }
+      }
+      
       const chunks: ArrayBuffer[] = [];
       for (const u of f.urls) {
          const chunkBlob = await fetchUrl(u);
@@ -168,7 +227,7 @@ export function SharePage() {
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(urlObj);
-    } catch(e: any) { toast.error(e.message); }
+    } catch(e: any) { toast.error(`Erreur: ${e.message}. Essayez l'extension Distock.`); }
   };
 
   if (error) {

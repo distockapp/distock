@@ -96,22 +96,30 @@ async function fetchUrlFromExtension(url: string): Promise<string | null> {
   return null;
 }
 
+// Our own CORS proxy (Cloudflare Worker) — primary, most reliable
+const DISTOCK_PROXY_URL = 'https://distock-cors-proxy.distock-proxy.workers.dev';
+
 async function fetchUrlFromProxy(url: string): Promise<Response> {
-  // Try multiple CORS proxies
+  // Try our own proxy first (guaranteed to work), then public fallbacks
   const proxies = [
-    `https://corsproxy.io/?${encodeURIComponent(url)}`,
+    `${DISTOCK_PROXY_URL}/?url=${encodeURIComponent(url)}`,
     `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+    `https://corsproxy.io/?${encodeURIComponent(url)}`,
     `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`
   ];
 
   let lastError: Error | null = null;
   for (const proxyUrl of proxies) {
     try {
-      const res = await fetch(proxyUrl);
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 30000);
+      const res = await fetch(proxyUrl, { signal: controller.signal });
+      clearTimeout(timeoutId);
       if (res.ok) return res;
+      console.warn(`[Distock] Proxy returned ${res.status}: ${proxyUrl}`);
     } catch (e) {
       lastError = e as Error;
-      console.warn(`[Distock] Proxy failed: ${proxyUrl}`);
+      console.warn(`[Distock] Proxy failed: ${proxyUrl}`, (e as Error).message);
     }
   }
   throw lastError || new Error('All proxies failed');
@@ -133,11 +141,56 @@ export async function fetchUrl(url: string): Promise<Blob> {
     // CORS blocked — expected without extension
   }
 
-  // 3. Fallback to CORS proxy
-  return await (await fetchUrlFromProxy(url)).blob();
+  // 3. Fallback to CORS proxy with retry
+  let lastError: Error | null = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      return await (await fetchUrlFromProxy(url)).blob();
+    } catch (e) {
+      lastError = e as Error;
+      console.warn(`[Distock] All proxies failed (attempt ${attempt}/2):`, (e as Error).message);
+      if (attempt < 2) await sleep(1500);
+    }
+  }
+  throw lastError || new Error('Failed to fetch file chunk');
 }
 
 export type ProgressCallback = (value: number, total: number) => void;
+
+export class UploadController {
+  isPaused: boolean = false;
+  isCancelled: boolean = false;
+  private resolvePause: () => void = () => {};
+  private pausePromise: Promise<void> | null = null;
+
+  pause() {
+    if (this.isPaused || this.isCancelled) return;
+    this.isPaused = true;
+    this.pausePromise = new Promise(resolve => {
+      this.resolvePause = resolve;
+    });
+  }
+
+  resume() {
+    if (!this.isPaused) return;
+    this.isPaused = false;
+    this.resolvePause();
+    this.pausePromise = null;
+  }
+
+  cancel() {
+    this.isCancelled = true;
+    this.resume(); // Unblock if currently paused
+  }
+
+  async check() {
+    if (this.isCancelled) throw new Error('UPLOAD_CANCELLED');
+    if (this.isPaused && this.pausePromise) {
+      await this.pausePromise;
+    }
+    if (this.isCancelled) throw new Error('UPLOAD_CANCELLED');
+  }
+}
 
 export async function downloadFromAttachmentUrls(
   attachmentUrls: string[],
@@ -163,86 +216,43 @@ export async function downloadFromAttachmentUrls(
 
 class DiscordWebhookClient {
   private baseUrl: string;
-  private rateLimitWaits: Record<string, number> = {};
   readonly label: string;
   readonly webhookUrl: string;
 
+  // Two separate serial queues per webhook:
+  // - uploadQueue: for POST (sendAttachment) — 1 at a time per webhook
+  // - readQueue:   for GET/DELETE — 1 at a time per webhook
+  private uploadQueue: Promise<any> = Promise.resolve();
+  private readQueue: Promise<any> = Promise.resolve();
+
   constructor(webhookUrl: string) {
-    // Parse webhook URL to extract ID and token
     const id = webhookUrl.split('/').slice(0, -1).pop();
     const token = webhookUrl.split('/').pop();
-    // Use discord.com — discordapp.com is deprecated and causes CORS redirect failures on POST requests
     this.baseUrl = `https://discord.com/api/webhooks/${id}/${token}`;
     this.webhookUrl = this.baseUrl;
     this.label = `WH-${id?.slice(-4) || '????'}`;
   }
 
-  async fetchFromApi(
-    path: string,
-    { type, method, body, retries = 0 }: { type: string; method: string; body?: BodyInit, retries?: number }
-  ): Promise<Response> {
-    if (retries > 3) throw new Error('[Distock] Max retries exceeded due to persistent rate limit or network block.');
-    // Wait if we're rate limited for this operation type
-    if (this.rateLimitWaits[type] > 0) {
-      console.log(`[Distock][${this.label}] Rate limit: waiting ${this.rateLimitWaits[type]}ms (${type})`);
-      await sleep(this.rateLimitWaits[type]);
-    }
+  private enqueueUpload<T>(task: () => Promise<T>): Promise<T> {
+    const next = this.uploadQueue.then(() => task(), () => task());
+    this.uploadQueue = next.then(() => {}, () => {});
+    return next;
+  }
 
-    let response: Response;
-    try {
-      response = await fetch(`${this.baseUrl}${path}`, { method, body });
-    } catch (err: any) {
-      if (err.name === 'TypeError' || err.message.includes('Failed to fetch')) {
-         console.warn(`[Distock][${this.label}] CORS/Network blinddrop! Evading via secure proxy...`);
-         const targetUrl = `${this.baseUrl}${path}`;
-         try {
-            response = await fetch(`https://corsproxy.io/?url=${encodeURIComponent(targetUrl)}`, { method, body });
-         } catch (proxyErr) {
-            const backoffTime = 5000;
-            console.warn(`[Distock][${this.label}] Proxy also failed. Backing off for ${backoffTime/1000}s`);
-            this.rateLimitWaits[type] = backoffTime;
-            await sleep(backoffTime);
-            return await this.fetchFromApi(path, { type, method, body, retries: retries + 1 });
-         }
-      } else {
-         throw err;
-      }
-    }
-
-    // Read Discord's rate limit headers
-    const remaining = Number(response.headers.get('X-RateLimit-Remaining'));
-    const resetAfter = Number(response.headers.get('X-RateLimit-Reset-After'));
-    this.rateLimitWaits[type] = remaining === 0 ? resetAfter * 1000 : 0;
-
-    if (response.status === 429) {
-      let retryAfter = 5; // Default 5 seconds
-      try {
-         const data = await response.json();
-         retryAfter = data.retry_after || 5;
-      } catch (parseErr) {
-         console.warn(`[Distock][${this.label}] 429 returned non-JSON (Cloudflare block?). Defauling to 10s backoff.`);
-         retryAfter = 10;
-      }
-      this.rateLimitWaits[type] = retryAfter * 1000;
-      console.warn(`[Distock][${this.label}] 429 rate limited — retrying after ${retryAfter}s`);
-      return await this.fetchFromApi(path, { type, method, body, retries: retries + 1 });
-    }
-
-    if (response.status >= 400) {
-      const text = await response.text().catch(() => '');
-      throw new Error(`Discord API error ${response.status}: ${text}`);
-    }
-
-    return response;
+  private enqueueRead<T>(task: () => Promise<T>): Promise<T> {
+    const next = this.readQueue.then(() => task(), () => task());
+    this.readQueue = next.then(() => {}, () => {});
+    return next;
   }
 
   async sendAttachment(filename: string, blob: Blob): Promise<{ id: string }> {
-    // We must use the background.js proxy to bypass uBlock Origin / Brave Shields.
-    // Direct `fetch()` to discord.com/api/webhooks is blocked by ERR_BLOCKED_BY_CLIENT globally!
-    // We convert the file to a base64 string because Chrome IPC limits cause V8 engine crashes on ArrayBuffers.
-    
+    return this.enqueueUpload(() => this._sendAttachmentOnce(filename, blob, 0));
+  }
+
+  private async _sendAttachmentOnce(filename: string, blob: Blob, retries: number): Promise<{ id: string }> {
+    if (retries > 15) throw new Error('[Distock] Max retries exceeded due to persistent rate limit or network block.');
+
     if (typeof document !== 'undefined' && document.documentElement.dataset.distockExtension) {
-      // Convert Blob to Base64
       const base64Data: string = await new Promise((resolve, reject) => {
         const reader = new FileReader();
         reader.onloadend = () => resolve(reader.result as string);
@@ -250,57 +260,80 @@ class DiscordWebhookClient {
         reader.readAsDataURL(blob);
       });
 
-      const response: any = await new Promise((resolve) => {
+      const response: any = await new Promise((resolve, reject) => {
         const reqId = `up_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+
+        const timeoutId = setTimeout(() => {
+          window.removeEventListener('message', handler);
+          reject(new Error('Timeout du proxy (90s)'));
+        }, 90000);
+
         const handler = (event: MessageEvent) => {
-          if (
-            event.source !== window || 
-            event.data?.requestId !== reqId || 
-            event.data?.source !== 'DISTOCK_EXTENSION'
-          ) return;
+          if (event.source !== window || event.data?.requestId !== reqId || event.data?.source !== 'DISTOCK_EXTENSION') return;
+          clearTimeout(timeoutId);
           window.removeEventListener('message', handler);
           resolve(event.data);
         };
         window.addEventListener('message', handler);
-        window.postMessage({
-          source: 'DISTOCK_PAGE',
-          type: 'UPLOAD_CHUNK',
-          requestId: reqId,
-          url: `${this.baseUrl}?wait=true`,
-          filename,
-          base64: base64Data
-        }, '*');
+        window.postMessage({ source: 'DISTOCK_PAGE', type: 'UPLOAD_CHUNK', requestId: reqId, url: `${this.baseUrl}?wait=true`, filename, base64: base64Data }, '*');
       });
+
+      if (response.status === 429) {
+        let retryAfter = 2;
+        try {
+          const data = JSON.parse((response.error || '').replace('Upload proxy error: ', ''));
+          if (data?.retry_after) retryAfter = data.retry_after + 0.5;
+        } catch { /* use default */ }
+        await sleep(retryAfter * 1000);
+        return this._sendAttachmentOnce(filename, blob, retries + 1);
+      }
 
       if (response.error) throw new Error(response.error);
       if (response.status >= 400) throw new Error(`Status ${response.status}`);
       return response.data;
     }
 
-    // Fallback if extension is somehow missing, though it will likely fail with ERR_BLOCKED_BY_CLIENT
+    // Fallback: direct fetch (likely CORS-blocked without extension)
     const formData = new FormData();
     formData.append('payload_json', JSON.stringify({}));
     formData.append('file', blob, filename);
-    const response = await this.fetchFromApi('?wait=true', {
-      type: 'sendAttachment',
-      method: 'POST',
-      body: formData,
-    });
-    return await response.json();
+    const res = await fetch(`${this.baseUrl}?wait=true`, { method: 'POST', body: formData });
+
+    if (res.status === 429) {
+      let retryAfter = 2;
+      try { retryAfter = (await res.json()).retry_after || 2; } catch { /* ignore */ }
+      await sleep(retryAfter * 1000);
+      return this._sendAttachmentOnce(filename, blob, retries + 1);
+    }
+
+    if (!res.ok) throw new Error(`Discord API error ${res.status}`);
+    return await res.json();
   }
 
   async getMessage(id: string): Promise<any> {
-    const response = await this.fetchFromApi(`/messages/${id}`, {
-      type: 'getMessage',
-      method: 'GET',
+    return this.enqueueRead(async () => {
+      const res = await fetch(`${this.baseUrl}/messages/${id}`);
+      if (res.status === 429) {
+        let retryAfter = 2;
+        try { retryAfter = (await res.json()).retry_after || 2; } catch { /* ignore */ }
+        await sleep(retryAfter * 1000);
+        return this.getMessage(id);
+      }
+      if (!res.ok) throw new Error(`Discord API error ${res.status}`);
+      return res.json();
     });
-    return await response.json();
   }
 
   async deleteMessage(id: string): Promise<void> {
-    await this.fetchFromApi(`/messages/${id}`, {
-      type: 'deleteMessage',
-      method: 'DELETE',
+    return this.enqueueRead(async () => {
+      const res = await fetch(`${this.baseUrl}/messages/${id}`, { method: 'DELETE' });
+      if (res.status === 429) {
+        let retryAfter = 2;
+        try { retryAfter = (await res.json()).retry_after || 2; } catch { /* ignore */ }
+        await sleep(retryAfter * 1000);
+        return this.deleteMessage(id);
+      }
+      if (!res.ok && res.status !== 404) throw new Error(`Discord API error ${res.status}`);
     });
   }
 }
@@ -368,7 +401,8 @@ class DiscordFileStorage {
   async upload(
     sourceFile: File,
     namePrefix: string,
-    onProgress: ProgressCallback | null = null
+    onProgress: ProgressCallback | null = null,
+    controller?: UploadController
   ): Promise<string[]> {
     const totalChunks = Math.ceil(sourceFile.size / CHUNK_SIZE);
     const messageIdMap: string[] = new Array(totalChunks).fill("");
@@ -380,8 +414,18 @@ class DiscordFileStorage {
 
     if (onProgress) onProgress(0, sourceFile.size);
 
-    const processBatch = async (batch: any[]) => {
-      await Promise.all(batch.map(async (item) => {
+    const activeUploads = new Set<Promise<void>>();
+
+    for await (const chunk of readFile(sourceFile, CHUNK_SIZE)) {
+      if (controller) await controller.check();
+      
+      const clientIndex = index % this.webhookClients.length;
+      const client = this.webhookClients[clientIndex];
+      const chunkLabel = `${namePrefix}_${index}`;
+      
+      const item = { chunk, index, client, chunkLabel };
+      
+      const uploadTask = (async () => {
         let attempts = 0;
         const maxAttempts = 5;
         let result: any = null;
@@ -402,13 +446,12 @@ class DiscordFileStorage {
             const speed = (item.chunk.byteLength / 1024 / 1024) / Math.max(elapsed, 0.1);
             console.log(`[Distock][${item.client.label}] ✓ Chunk ${item.index} done in ${elapsed.toFixed(1)}s (${speed.toFixed(1)} MB/s)`);
             
-            break; // Success, exit retry loop
+            break; // Success
           } catch (error: any) {
             console.warn(`[Distock][${item.client.label}] Chunk ${item.index} failed (attempt ${attempts}/${maxAttempts}):`, error.message);
             if (attempts >= maxAttempts) {
                throw new Error(`Failed to upload chunk ${item.index} after ${maxAttempts} attempts: ${error.message}`);
             }
-            // Exponential backoff
             await sleep(Math.pow(2, attempts) * 1000 + (Math.random() * 1000));
           }
         }
@@ -416,30 +459,26 @@ class DiscordFileStorage {
         if (!result || !result.id) {
           throw new Error(`Result is irrevocably undefined after loop!`);
         }
-        // Pin the chunk mathematically to its owner webhook forever
         messageIdMap[item.index] = `${item.client.webhookUrl}|${result.id}`;
         uploadedBytes += item.chunk.byteLength;
         if (onProgress) onProgress(uploadedBytes, sourceFile.size);
-      }));
-    };
+      })();
 
-    let currentBatch: any[] = [];
-    for await (const chunk of readFile(sourceFile, CHUNK_SIZE)) {
-      const clientIndex = index % this.webhookClients.length;
-      const client = this.webhookClients[clientIndex];
-      const chunkLabel = `${namePrefix}_${index}`;
+      activeUploads.add(uploadTask);
+      uploadTask.finally(() => activeUploads.delete(uploadTask));
       
-      currentBatch.push({ chunk, index, client, chunkLabel });
-      
-      if (currentBatch.length >= this.webhookClients.length) {
-        await processBatch(currentBatch);
-        currentBatch = [];
+      // Allow N+1 concurrent uploads (each webhook has its own serial queue)
+      // so one webhook finishing immediately triggers the next without a gap
+      while (activeUploads.size >= this.webhookClients.length + 1) {
+        if (controller) await controller.check();
+        await Promise.race(activeUploads);
       }
       index++;
     }
 
-    if (currentBatch.length > 0) {
-      await processBatch(currentBatch);
+    if (activeUploads.size > 0) {
+      if (controller) await controller.check();
+      await Promise.all(activeUploads);
     }
 
     console.log(`[Distock] ✓ Upload complete: ${messageIdMap.length} chunks`);
@@ -554,27 +593,39 @@ export class DisboxFileManager {
     const fileTrees: Record<string, any> = {};
 
     // Execute requests in parallel to drastically reduce cold start server delays
-    const fetchPromises = ['discord.com', 'discordapp.com'].map(async (hostname) => {
+    // Retry up to 3 times to handle Fly.io cold starts (server may take >25s to wake)
+    const fetchTreeForHost = async (hostname: string): Promise<void> => {
       const testUrl = new URL(webhookUrl);
       testUrl.hostname = hostname;
-      try {
-        // Build a 25-second timeout controller in case the Fly.io server stalls
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 25000);
-        
-        const result = await fetch(`${SERVER_URL}/files/get/${sha256(testUrl.href)}`, {
-           signal: controller.signal
-        });
-        
-        clearTimeout(timeoutId);
-        
-        if (result.status === 200) {
-          fileTrees[testUrl.href] = await result.json();
+
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const abortCtrl = new AbortController();
+          const timeoutId = setTimeout(() => abortCtrl.abort(), 60000); // 60s timeout
+
+          const result = await fetch(`${SERVER_URL}/files/get/${sha256(testUrl.href)}`, {
+            signal: abortCtrl.signal
+          });
+
+          clearTimeout(timeoutId);
+
+          if (result.status === 200) {
+            fileTrees[testUrl.href] = await result.json();
+            return; // success
+          }
+          // Non-200 but not a throw: just continue to next attempt
+        } catch (e: any) {
+          if (attempt < 3) {
+            console.warn(`[Distock] Tree fetch for ${hostname} failed (attempt ${attempt}/3), retrying in 3s...`, e?.message);
+            await sleep(3000);
+          } else {
+            console.warn(`[Distock] Failed to fetch tree for ${hostname}:`, e);
+          }
         }
-      } catch (e) {
-        console.warn(`[Distock] Failed to fetch tree for ${hostname}:`, e);
       }
-    });
+    };
+
+    const fetchPromises = ['discord.com', 'discordapp.com'].map(h => fetchTreeForHost(h));
 
     await Promise.all(fetchPromises);
 
@@ -745,7 +796,7 @@ export class DisboxFileManager {
     return this.getFile(path);
   }
 
-  async uploadFile(path: string, fileBlob: File, onProgress?: ProgressCallback) {
+  async uploadFile(path: string, fileBlob: File, onProgress?: ProgressCallback, controller?: UploadController) {
     let file = this.getFile(path);
     if (!file) {
       await this.createFile(path);
@@ -753,7 +804,7 @@ export class DisboxFileManager {
     }
     if (file!.type === 'directory') throw new Error(`Cannot upload to directory: ${path}`);
 
-    const contentRefs = await this.discordFileStorage.upload(fileBlob, file!.id.toString(), onProgress || null);
+    const contentRefs = await this.discordFileStorage.upload(fileBlob, file!.id.toString(), onProgress || null, controller);
     await this.updateFile(file!.path!, { size: fileBlob.size, content: JSON.stringify(contentRefs) });
 
     return file;

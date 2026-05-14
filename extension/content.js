@@ -3,6 +3,7 @@
 
 (function() {
   document.documentElement.dataset.distockExtension = 'true';
+  document.documentElement.dataset.distockExtensionVersion = '5.0.0';
 
   window.addEventListener('message', (event) => {
     if (event.source !== window || !event.data || event.data.source !== 'DISTOCK_PAGE') return;
